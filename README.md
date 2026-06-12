@@ -10,7 +10,8 @@ It turns architecture trade-offs into a structured Decision Room: expert agents 
 - Deterministic expert agents: Principal Architect, SRE Reviewer, Security Reviewer, Cost Engineer, and Pragmatic Builder.
 - Borda Count ranking, weighted utility scoring, regret penalty, Quorum Score, and Dissent Index.
 - Risk Radar, Pre-Mortem review, and ADR Markdown generation.
-- A polished React portfolio UI that runs without API keys.
+- A polished technical command-center UI that runs without API keys.
+- English and Chinese interface switching for product demos.
 
 ## Local-Only Environment
 
@@ -45,6 +46,12 @@ Default question:
 > Should a B2B SaaS MVP use schema-per-tenant or shared tables with tenant_id in PostgreSQL?
 
 QuorumMind evaluates the trade-off and generates a final ADR recommending shared-table tenancy with explicit tenant-boundary tests, per-tenant metrics, and a documented upgrade path to stronger isolation.
+
+## Interface Language
+
+The UI can switch between English and Chinese from the top-right language control.
+
+The current MVP localizes interface labels, module headings, agent role names, risk categories, action buttons, and context chips. The deterministic demo report body is still generated in English. When real GPT, Gemini, and DeepSeek providers are added, the selected language should be passed into each provider prompt so proposals, critiques, and ADR content can be generated in the same language.
 
 ## Resume Bullet
 

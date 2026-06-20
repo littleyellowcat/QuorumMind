@@ -10,6 +10,7 @@ import {
 } from "../../src/lib/blueprint";
 import type { DecisionContext, DecisionMode } from "../../src/lib/domain";
 import type { LiveDecisionTraceEntry } from "../live-decision";
+import { buildKnowledgeInjection } from "../../src/lib/knowledge-inject";
 
 export type AutonomousAgentPlatformRuntime = {
   orchestrator: "langgraph";
@@ -57,6 +58,7 @@ export type AutonomousGoalBrief = {
   likelyPattern: "visual_novel_multi_agent" | "generic_blueprint";
   constraints: string[];
   successSignals: string[];
+  knowledgeInjection?: string;
 };
 
 export type AutonomousValidationReport = {
@@ -485,12 +487,20 @@ function buildAutonomousBlueprintGraph(options: {
 function understandRequestNode(liveModel: NonNullable<RunAutonomousBlueprintGraphInput["liveModel"]>) {
   return async (state: AutonomousBlueprintGraphState): Promise<AutonomousBlueprintGraphUpdate> => {
     const goalBrief = buildGoalBrief(state);
+    const knowledgeInjection = buildKnowledgeInjection(state.question, state.context);
+    if (knowledgeInjection) {
+      goalBrief.knowledgeInjection = knowledgeInjection;
+    }
     const baseTrace: AutonomousAgentTraceEntry = {
       node: "understand_request",
       agentId: "goal-agent",
       status: "complete",
       summary: state.locale === "zh" ? "已识别目标、约束和成功信号。" : "Identified goal, constraints, and success signals.",
-      evidence: [goalBrief.likelyPattern, ...goalBrief.successSignals]
+      evidence: [
+        goalBrief.likelyPattern,
+        ...goalBrief.successSignals,
+        ...(knowledgeInjection ? [`knowledge_injection: ${knowledgeInjection.length} chars`] : [])
+      ]
     };
 
     if (!liveModel.requested || !liveModel.runner) {

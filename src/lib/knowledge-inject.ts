@@ -1,5 +1,4 @@
 import { resolveDataDir, loadIndex, searchIndex } from "./knowledge-index";
-import { readKnowledgeFile } from "./knowledge-store";
 import type { DecisionContext } from "./domain";
 import { inferDecisionDomain } from "./model-reputation";
 

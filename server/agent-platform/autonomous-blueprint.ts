@@ -11,6 +11,14 @@ import {
 import type { DecisionContext, DecisionMode } from "../../src/lib/domain";
 import type { LiveDecisionTraceEntry } from "../live-decision";
 import { buildKnowledgeInjection } from "../../src/lib/knowledge-inject";
+import {
+  compressContext,
+  estimateTokenCount,
+  logPressure,
+  persistContextSummary,
+  type CompressionResult,
+  DEFAULT_MAX_TOKENS
+} from "../context-compressor";
 
 export type AutonomousAgentPlatformRuntime = {
   orchestrator: "langgraph";
@@ -135,6 +143,8 @@ export type AutonomousBlueprintRun = {
   validation: AutonomousValidationReport;
   summary: AutonomousBlueprintSummary;
   result: BlueprintRoomResult;
+  contextSummary?: string;
+  contextCompressedAt?: number;
 };
 
 export type RunAutonomousBlueprintGraphInput = {
@@ -332,18 +342,24 @@ const AutonomousBlueprintAnnotation = Annotation.Root({
   routeDecisions: Annotation<AutonomousRouteDecision[]>({
     reducer: (left, right) => left.concat(right),
     default: () => []
-  })
+  }),
+  contextSummary: Annotation<string | undefined>(),
+  contextCompressedAt: Annotation<number | undefined>()
 });
 
 type AutonomousBlueprintGraphState = typeof AutonomousBlueprintAnnotation.State;
 type AutonomousBlueprintGraphUpdate = typeof AutonomousBlueprintAnnotation.Update;
 const AUTONOMOUS_GRAPH_RECURSION_LIMIT = 24;
 const MAX_CONSENSUS_ROUNDS_LIMIT = 8;
+
+/** Module-level reference to the SQLite DB, set when SqliteSaver is in use. */
+let sqliteDb: DatabaseSync | undefined;
+
 function getCheckpointer() {
   const dbPath = process.env.QUORUMMIND_SQLITE_PATH;
   if (dbPath) {
-    const db = new DatabaseSync(dbPath);
-    return createSqliteSaver(db);
+    sqliteDb = new DatabaseSync(dbPath);
+    return createSqliteSaver(sqliteDb);
   }
   return new MemorySaver();
 }
@@ -414,7 +430,9 @@ export async function runAutonomousBlueprintGraph(input: RunAutonomousBlueprintG
     routeDecisions: finalState.routeDecisions,
     validation: finalState.validation,
     summary: finalState.summary,
-    result: finalState.result
+    result: finalState.result,
+    contextSummary: finalState.contextSummary,
+    contextCompressedAt: finalState.contextCompressedAt
   };
 }
 
@@ -491,6 +509,9 @@ function understandRequestNode(liveModel: NonNullable<RunAutonomousBlueprintGrap
     if (knowledgeInjection) {
       goalBrief.knowledgeInjection = knowledgeInjection;
     }
+    const augmentedQuestion = knowledgeInjection
+      ? `${knowledgeInjection}\n\n---\n\n${state.question}`
+      : state.question;
     const baseTrace: AutonomousAgentTraceEntry = {
       node: "understand_request",
       agentId: "goal-agent",
@@ -505,6 +526,7 @@ function understandRequestNode(liveModel: NonNullable<RunAutonomousBlueprintGrap
 
     if (!liveModel.requested || !liveModel.runner) {
       return {
+        question: augmentedQuestion,
         goalBrief,
         trace: [
           liveModel.requested
@@ -527,6 +549,7 @@ function understandRequestNode(liveModel: NonNullable<RunAutonomousBlueprintGrap
       const phaseSummary = summarizeTracePhases(providerTrace);
 
       return {
+        question: augmentedQuestion,
         goalBrief,
         providerTrace,
         liveModel: summary,
@@ -564,6 +587,7 @@ function understandRequestNode(liveModel: NonNullable<RunAutonomousBlueprintGrap
       });
 
       return {
+        question: augmentedQuestion,
         goalBrief,
         liveModel: summary,
         trace: [
@@ -736,6 +760,25 @@ function liveModelReviewNode(liveModel: NonNullable<RunAutonomousBlueprintGraphI
 
 function crossReviewNode(state: AutonomousBlueprintGraphState): AutonomousBlueprintGraphUpdate {
   const result = requireBlueprintResult(state);
+
+  // ── Context compression check ──────────────────────────────
+  const compression = compressContext(state);
+  const compressionUpdate: Partial<AutonomousBlueprintGraphUpdate> = {};
+  if (compression.didCompress) {
+    compressionUpdate.contextSummary = compression.summary ?? undefined;
+    compressionUpdate.contextCompressedAt = state.currentConsensusRoundIndex;
+    logPressure(state.runId, compression.fillRatio, "compressed", sqliteDb);
+    persistContextSummary(
+      state.runId,
+      state.currentConsensusRoundIndex,
+      "consolidated",
+      compression.summary ?? "",
+      Math.ceil(compression.fillRatio * DEFAULT_MAX_TOKENS),
+      estimateTokenCount(compression.summary ?? ""),
+      sqliteDb
+    );
+  }
+
   const deferred = result.finalSpec.adoptionLedger.filter((item) => item.adoptionStatus === "deferred");
   const watchItems = result.finalSpec.evaluationMatrix.filter((item) => item.status !== "strong");
   const liveCritiques = state.providerTrace.filter(
@@ -754,6 +797,7 @@ function crossReviewNode(state: AutonomousBlueprintGraphState): AutonomousBluepr
   ];
 
   return {
+    ...compressionUpdate,
     toolCalls:
       liveCritiques.length > 0
         ? [
@@ -783,6 +827,25 @@ function crossReviewNode(state: AutonomousBlueprintGraphState): AutonomousBluepr
 
 async function validateResultNode(state: AutonomousBlueprintGraphState): Promise<AutonomousBlueprintGraphUpdate> {
   const result = requireBlueprintResult(state);
+
+  // ── Context compression check ──────────────────────────────
+  const compression = compressContext(state);
+  const compressionUpdate: Partial<AutonomousBlueprintGraphUpdate> = {};
+  if (compression.didCompress) {
+    compressionUpdate.contextSummary = compression.summary ?? undefined;
+    compressionUpdate.contextCompressedAt = state.currentConsensusRoundIndex;
+    logPressure(state.runId, compression.fillRatio, "compressed", sqliteDb);
+    persistContextSummary(
+      state.runId,
+      state.currentConsensusRoundIndex,
+      "incremental",
+      compression.summary ?? "",
+      Math.ceil(compression.fillRatio * DEFAULT_MAX_TOKENS),
+      estimateTokenCount(compression.summary ?? ""),
+      sqliteDb
+    );
+  }
+
   const roundIndex = Math.min(state.currentConsensusRoundIndex, result.consensusRounds.length - 1);
   const currentRound = result.consensusRounds[roundIndex];
   const totalRounds = result.consensusRounds.length;
@@ -807,6 +870,7 @@ async function validateResultNode(state: AutonomousBlueprintGraphState): Promise
     action === "continue" ? "below_threshold_can_revise" : validation.terminationReason;
 
   return {
+    ...compressionUpdate,
     validation,
     consensusLoop: [
       {

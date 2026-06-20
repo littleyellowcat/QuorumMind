@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS langgraph_checkpoints (
   thread_id TEXT NOT NULL,
   checkpoint_id TEXT NOT NULL,
   parent_checkpoint_id TEXT,
+  checkpoint_ns TEXT NOT NULL DEFAULT '',
   checkpoint_data TEXT NOT NULL,
   metadata_json TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -60,3 +61,28 @@ CREATE TABLE IF NOT EXISTS langgraph_writes (
   value_json TEXT NOT NULL,
   PRIMARY KEY (thread_id, checkpoint_id, task_id, idx)
 );
+
+-- Context compression tables (WBC — Write-Before-Compaction)
+
+CREATE TABLE IF NOT EXISTS context_summaries (
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  round_number INTEGER NOT NULL,
+  summary_type TEXT NOT NULL CHECK(summary_type IN ('incremental','consolidated')),
+  content TEXT NOT NULL,
+  compressed_at TEXT NOT NULL,
+  token_count_before INTEGER,
+  token_count_after INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_summaries_thread ON context_summaries(thread_id, round_number);
+
+CREATE TABLE IF NOT EXISTS pressure_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL,
+  recorded_at TEXT NOT NULL DEFAULT (datetime('now')),
+  fill_ratio REAL NOT NULL,
+  action TEXT NOT NULL CHECK(action IN ('none','compressed','emergency'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pressure_log_thread ON pressure_log(thread_id, recorded_at DESC);

@@ -229,14 +229,57 @@ export function assembleCompressedContext(
   return parts.join("\n\n---\n\n");
 }
 
+/**
+ * Extract human-readable tail messages from a CompressedStateSlice.
+ * These messages provide continuity after the compressed summary when
+ * passed to {@link assembleCompressedContext}.
+ */
+export function extractTailMessages(slice: CompressedStateSlice): string[] {
+  const messages: string[] = [];
+
+  for (const entry of slice.trace) {
+    messages.push(`[trace:${entry.node}] ${entry.summary}`);
+  }
+  for (const entry of slice.consensusLoop) {
+    messages.push(`[consensus:R${entry.round}] ${entry.summary}`);
+  }
+  for (const entry of slice.toolCalls) {
+    messages.push(`[tool:${entry.toolName}] ${entry.outputSummary}`);
+  }
+
+  return messages;
+}
+
+// ── Compressed state slice ────────────────────────────────────
+
+/**
+ * A truncated snapshot of the accumulated state arrays after compression.
+ * Only the last 2 entries of each array are kept for continuity;
+ * the full history is replaced by the context summary.
+ */
+export type CompressedStateSlice = {
+  trace: AutonomousAgentTraceEntry[];
+  toolCalls: AutonomousToolCall[];
+  consensusLoop: AutonomousConsensusIteration[];
+  providerTrace: LiveDecisionTraceEntry[];
+  contextSummary: string;
+};
+
 // ── Compression result ────────────────────────────────────────
 
 export type CompressionResult = {
   didCompress: boolean;
   summary: string | null;
   constraints: string[];
-  /** Fill ratio of the context window (0-1). Only meaningful when didCompress is true. */
+  /** Fill ratio of the context window (0-1). */
   fillRatio: number;
+  /**
+   * Truncated state arrays (last 2 entries each) plus the context summary.
+   * Only populated when didCompress is true. The caller should replace the
+   * accumulated arrays with these truncated versions so subsequent rounds
+   * see reduced context usage.
+   */
+  compressedSlice?: CompressedStateSlice;
 };
 
 // ── Main compression function ─────────────────────────────────
@@ -273,7 +316,17 @@ export function compressContext(
   const constraints = extractConstraints(messages);
   const summary = buildContextSummary(state);
 
-  return { didCompress: true, summary, constraints, fillRatio };
+  // Build truncated state slice: keep only the last 2 entries per array
+  // for continuity. The full history is represented by the summary.
+  const compressedSlice: CompressedStateSlice = {
+    trace: (state.trace ?? []).slice(-2),
+    toolCalls: (state.toolCalls ?? []).slice(-2),
+    consensusLoop: (state.consensusLoop ?? []).slice(-2),
+    providerTrace: (state.providerTrace ?? []).slice(-2),
+    contextSummary: summary,
+  };
+
+  return { didCompress: true, summary, constraints, fillRatio, compressedSlice };
 }
 
 // ── Pressure logging ──────────────────────────────────────────

@@ -16,7 +16,10 @@ import {
   estimateTokenCount,
   logPressure,
   persistContextSummary,
+  assembleCompressedContext,
+  extractTailMessages,
   type CompressionResult,
+  type CompressedStateSlice,
   DEFAULT_MAX_TOKENS
 } from "../context-compressor";
 
@@ -309,6 +312,11 @@ const selectNextActionsTool = tool(
   }
 );
 
+/** Internal sentinel used by array reducers to signal state truncation during compression.
+ *  When the first element of an update array is this sentinel, the reducer clears the
+ *  accumulated array and replaces it with the remaining elements. */
+const QM_TRUNCATE = { __qm_truncate: true as const };
+
 const AutonomousBlueprintAnnotation = Annotation.Root({
   runId: Annotation<string>(),
   question: Annotation<string>(),
@@ -323,24 +331,54 @@ const AutonomousBlueprintAnnotation = Annotation.Root({
   validation: Annotation<AutonomousValidationReport | undefined>(),
   summary: Annotation<AutonomousBlueprintSummary | undefined>(),
   trace: Annotation<AutonomousAgentTraceEntry[]>({
-    reducer: (left, right) => left.concat(right),
+    reducer: (left, right) => {
+      const arr = right as any[];
+      if (arr.length > 0 && arr[0]?.__qm_truncate === true) {
+        return arr.slice(1) as AutonomousAgentTraceEntry[];
+      }
+      return left.concat(right);
+    },
     default: () => []
   }),
   toolCalls: Annotation<AutonomousToolCall[]>({
-    reducer: (left, right) => left.concat(right),
+    reducer: (left, right) => {
+      const arr = right as any[];
+      if (arr.length > 0 && arr[0]?.__qm_truncate === true) {
+        return arr.slice(1) as AutonomousToolCall[];
+      }
+      return left.concat(right);
+    },
     default: () => []
   }),
   providerTrace: Annotation<LiveDecisionTraceEntry[]>({
-    reducer: (left, right) => left.concat(right),
+    reducer: (left, right) => {
+      const arr = right as any[];
+      if (arr.length > 0 && arr[0]?.__qm_truncate === true) {
+        return arr.slice(1) as LiveDecisionTraceEntry[];
+      }
+      return left.concat(right);
+    },
     default: () => []
   }),
   liveModel: Annotation<AutonomousLiveModelSummary | undefined>(),
   consensusLoop: Annotation<AutonomousConsensusIteration[]>({
-    reducer: (left, right) => left.concat(right),
+    reducer: (left, right) => {
+      const arr = right as any[];
+      if (arr.length > 0 && arr[0]?.__qm_truncate === true) {
+        return arr.slice(1) as AutonomousConsensusIteration[];
+      }
+      return left.concat(right);
+    },
     default: () => []
   }),
   routeDecisions: Annotation<AutonomousRouteDecision[]>({
-    reducer: (left, right) => left.concat(right),
+    reducer: (left, right) => {
+      const arr = right as any[];
+      if (arr.length > 0 && arr[0]?.__qm_truncate === true) {
+        return arr.slice(1) as AutonomousRouteDecision[];
+      }
+      return left.concat(right);
+    },
     default: () => []
   }),
   contextSummary: Annotation<string | undefined>(),
@@ -763,22 +801,10 @@ function crossReviewNode(state: AutonomousBlueprintGraphState): AutonomousBluepr
 
   // ── Context compression check ──────────────────────────────
   const compression = compressContext(state);
-  const compressionUpdate: Partial<AutonomousBlueprintGraphUpdate> = {};
-  if (compression.didCompress) {
-    compressionUpdate.contextSummary = compression.summary ?? undefined;
-    compressionUpdate.contextCompressedAt = state.currentConsensusRoundIndex;
-    logPressure(state.runId, compression.fillRatio, "compressed", sqliteDb);
-    persistContextSummary(
-      state.runId,
-      state.currentConsensusRoundIndex,
-      "consolidated",
-      compression.summary ?? "",
-      Math.ceil(compression.fillRatio * DEFAULT_MAX_TOKENS),
-      estimateTokenCount(compression.summary ?? ""),
-      sqliteDb
-    );
-  }
+  const didCompress = compression.didCompress && !!compression.compressedSlice;
+  const slice = compression.compressedSlice;
 
+  // ── Node-level trace and tool calls ────────────────────────
   const deferred = result.finalSpec.adoptionLedger.filter((item) => item.adoptionStatus === "deferred");
   const watchItems = result.finalSpec.evaluationMatrix.filter((item) => item.status !== "strong");
   const liveCritiques = state.providerTrace.filter(
@@ -796,32 +822,67 @@ function crossReviewNode(state: AutonomousBlueprintGraphState): AutonomousBluepr
     ...(liveCritiques.length > 0 ? [`${liveCritiques.length} live critique traces`] : [])
   ];
 
+  const nodeTraceEntry: AutonomousAgentTraceEntry = {
+    node: "cross_review",
+    agentId: "quality-reviewer",
+    status: "complete",
+    summary:
+      state.locale === "zh"
+        ? "已汇总互评、修订和仍需关注的分歧。"
+        : "Summarized critique, revision, and remaining disagreement signals.",
+    evidence
+  };
+
+  const nodeToolCalls: AutonomousToolCall[] =
+    liveCritiques.length > 0
+      ? [
+          {
+            toolName: "quorummind_live_cross_review_trace",
+            node: "cross_review",
+            inputSummary: `${liveCritiques.length} usable live critique entries`,
+            outputSummary:
+              state.locale === "zh"
+                ? "真实模型质询证据已纳入交叉评审。"
+                : "Live critique evidence was included in cross-review.",
+            source: "live_model_provider"
+          }
+        ]
+      : [];
+
+  // ── Build return update ────────────────────────────────────
+  if (didCompress && slice) {
+    // Truncate accumulated arrays to tail + append current node entries
+    const assembled = assembleCompressedContext(
+      state.goalBrief?.goal ?? "",
+      state.goalBrief?.knowledgeInjection ?? "",
+      slice.contextSummary,
+      extractTailMessages(slice)
+    );
+
+    logPressure(state.runId, compression.fillRatio, "compressed", sqliteDb);
+    persistContextSummary(
+      state.runId,
+      state.currentConsensusRoundIndex,
+      "consolidated",
+      compression.summary ?? "",
+      Math.ceil(compression.fillRatio * DEFAULT_MAX_TOKENS),
+      estimateTokenCount(assembled),
+      sqliteDb
+    );
+
+    return {
+      contextSummary: assembled,
+      contextCompressedAt: state.currentConsensusRoundIndex,
+      trace: [QM_TRUNCATE as any, ...slice.trace, nodeTraceEntry],
+      toolCalls: [QM_TRUNCATE as any, ...slice.toolCalls, ...nodeToolCalls],
+      consensusLoop: [QM_TRUNCATE as any, ...slice.consensusLoop],
+      providerTrace: [QM_TRUNCATE as any, ...slice.providerTrace]
+    };
+  }
+
   return {
-    ...compressionUpdate,
-    toolCalls:
-      liveCritiques.length > 0
-        ? [
-            {
-              toolName: "quorummind_live_cross_review_trace",
-              node: "cross_review",
-              inputSummary: `${liveCritiques.length} usable live critique entries`,
-              outputSummary: state.locale === "zh" ? "真实模型质询证据已纳入交叉评审。" : "Live critique evidence was included in cross-review.",
-              source: "live_model_provider"
-            }
-          ]
-        : [],
-    trace: [
-      {
-        node: "cross_review",
-        agentId: "quality-reviewer",
-        status: "complete",
-        summary:
-          state.locale === "zh"
-            ? "已汇总互评、修订和仍需关注的分歧。"
-            : "Summarized critique, revision, and remaining disagreement signals.",
-        evidence
-      }
-    ]
+    trace: [nodeTraceEntry],
+    toolCalls: nodeToolCalls
   };
 }
 
@@ -830,22 +891,10 @@ async function validateResultNode(state: AutonomousBlueprintGraphState): Promise
 
   // ── Context compression check ──────────────────────────────
   const compression = compressContext(state);
-  const compressionUpdate: Partial<AutonomousBlueprintGraphUpdate> = {};
-  if (compression.didCompress) {
-    compressionUpdate.contextSummary = compression.summary ?? undefined;
-    compressionUpdate.contextCompressedAt = state.currentConsensusRoundIndex;
-    logPressure(state.runId, compression.fillRatio, "compressed", sqliteDb);
-    persistContextSummary(
-      state.runId,
-      state.currentConsensusRoundIndex,
-      "incremental",
-      compression.summary ?? "",
-      Math.ceil(compression.fillRatio * DEFAULT_MAX_TOKENS),
-      estimateTokenCount(compression.summary ?? ""),
-      sqliteDb
-    );
-  }
+  const didCompress = compression.didCompress && !!compression.compressedSlice;
+  const slice = compression.compressedSlice;
 
+  // ── Validation logic ───────────────────────────────────────
   const roundIndex = Math.min(state.currentConsensusRoundIndex, result.consensusRounds.length - 1);
   const currentRound = result.consensusRounds[roundIndex];
   const totalRounds = result.consensusRounds.length;
@@ -869,59 +918,91 @@ async function validateResultNode(state: AutonomousBlueprintGraphState): Promise
   const routeReason: AutonomousRouteDecision["reason"] =
     action === "continue" ? "below_threshold_can_revise" : validation.terminationReason;
 
-  return {
-    ...compressionUpdate,
-    validation,
-    consensusLoop: [
-      {
-        round: currentRound.round,
-        phase: currentRound.phase,
-        consensusScore: currentRound.consensusScore,
-        threshold: result.consensusThreshold,
-        passed: validation.passed,
-        action,
-        summary: currentRound.summary,
-        improvements: currentRound.improvements,
-        remainingDisagreements: currentRound.remainingDisagreements
-      }
-    ],
-    routeDecisions: [
-      {
-        fromNode: "validate_result",
-        toNode,
-        reason: routeReason,
-        round: currentRound.round,
-        consensusScore: currentRound.consensusScore,
-        threshold: result.consensusThreshold
-      }
-    ],
-    toolCalls: [
-      {
-        toolName: validateBlueprintTool.name,
-        node: "validate_result",
-        inputSummary: `round ${currentRound.round}/${totalRounds} · consensus ${currentRound.consensusScore}/${result.consensusThreshold}`,
-        outputSummary: validation.passed ? "passed" : `${validation.blockingIssues.join(" / ")} · ${action}`,
-        source: "langchain_tool"
-      }
-    ],
-    trace: [
-      {
-        node: "validate_result",
-        agentId: "consistency-auditor",
-        status: validation.passed ? "complete" : "needs_review",
-        summary:
-          state.locale === "zh"
-            ? `第 ${currentRound.round} 轮验证${validation.passed ? "通过" : validation.canRevise ? "未达阈值，继续讨论" : "需要人工复审"}。`
-            : `Round ${currentRound.round} validation ${
-                validation.passed ? "passed" : validation.canRevise ? "continues discussion" : "requires human review"
-              }.`,
-        evidence: [
-          `consensus ${validation.consensusScore}/${validation.threshold}`,
-          ...validation.blockingIssues,
-          ...validation.reviewWarnings
-        ]
-      }
+  // ── Node-level entries ─────────────────────────────────────
+  const nodeConsensusEntry: AutonomousConsensusIteration = {
+    round: currentRound.round,
+    phase: currentRound.phase,
+    consensusScore: currentRound.consensusScore,
+    threshold: result.consensusThreshold,
+    passed: validation.passed,
+    action,
+    summary: currentRound.summary,
+    improvements: currentRound.improvements,
+    remainingDisagreements: currentRound.remainingDisagreements
+  };
+
+  const nodeRouteEntry: AutonomousRouteDecision = {
+    fromNode: "validate_result",
+    toNode,
+    reason: routeReason,
+    round: currentRound.round,
+    consensusScore: currentRound.consensusScore,
+    threshold: result.consensusThreshold
+  };
+
+  const nodeToolCall: AutonomousToolCall = {
+    toolName: validateBlueprintTool.name,
+    node: "validate_result",
+    inputSummary: `round ${currentRound.round}/${totalRounds} · consensus ${currentRound.consensusScore}/${result.consensusThreshold}`,
+    outputSummary: validation.passed ? "passed" : `${validation.blockingIssues.join(" / ")} · ${action}`,
+    source: "langchain_tool"
+  };
+
+  const nodeTraceEntry: AutonomousAgentTraceEntry = {
+    node: "validate_result",
+    agentId: "consistency-auditor",
+    status: validation.passed ? "complete" : "needs_review",
+    summary:
+      state.locale === "zh"
+        ? `第 ${currentRound.round} 轮验证${validation.passed ? "通过" : validation.canRevise ? "未达阈值，继续讨论" : "需要人工复审"}。`
+        : `Round ${currentRound.round} validation ${
+            validation.passed ? "passed" : validation.canRevise ? "continues discussion" : "requires human review"
+          }.`,
+    evidence: [
+      `consensus ${validation.consensusScore}/${validation.threshold}`,
+      ...validation.blockingIssues,
+      ...validation.reviewWarnings
     ]
+  };
+
+  // ── Build return update ────────────────────────────────────
+  if (didCompress && slice) {
+    const assembled = assembleCompressedContext(
+      state.goalBrief?.goal ?? "",
+      state.goalBrief?.knowledgeInjection ?? "",
+      slice.contextSummary,
+      extractTailMessages(slice)
+    );
+
+    logPressure(state.runId, compression.fillRatio, "compressed", sqliteDb);
+    persistContextSummary(
+      state.runId,
+      state.currentConsensusRoundIndex,
+      "incremental",
+      compression.summary ?? "",
+      Math.ceil(compression.fillRatio * DEFAULT_MAX_TOKENS),
+      estimateTokenCount(assembled),
+      sqliteDb
+    );
+
+    return {
+      contextSummary: assembled,
+      contextCompressedAt: state.currentConsensusRoundIndex,
+      validation,
+      trace: [QM_TRUNCATE as any, ...slice.trace, nodeTraceEntry],
+      toolCalls: [QM_TRUNCATE as any, ...slice.toolCalls, nodeToolCall],
+      consensusLoop: [QM_TRUNCATE as any, ...slice.consensusLoop, nodeConsensusEntry],
+      providerTrace: [QM_TRUNCATE as any, ...slice.providerTrace],
+      routeDecisions: [QM_TRUNCATE as any, ...(state.routeDecisions ?? []).slice(-2), nodeRouteEntry]
+    };
+  }
+
+  return {
+    validation,
+    consensusLoop: [nodeConsensusEntry],
+    routeDecisions: [nodeRouteEntry],
+    toolCalls: [nodeToolCall],
+    trace: [nodeTraceEntry]
   };
 }
 

@@ -20,7 +20,7 @@ type RunDecisionRoomInput = {
   context: DecisionContext;
 };
 
-type DecisionRoomResult = {
+export type DecisionRoomResult = {
   roomId: string;
   question: string;
   mode: DecisionMode;
@@ -53,7 +53,7 @@ export function runDecisionRoom(input: RunDecisionRoomInput): DecisionRoomResult
   const knowledgeInjection = buildKnowledgeInjection(input.question, input.context);
   const agents = createDefaultAgents();
   const activeAgents = input.mode === "fast" ? agents.slice(0, 3) : agents;
-  const initialProposals = activeAgents.map((agent) => generateProposal(roomId, agent, input.context, input.question));
+  const initialProposals = activeAgents.map((agent) => generateProposal(roomId, agent, input.context, input.question, knowledgeInjection));
   const critiques = activeAgents.flatMap((reviewer) =>
     initialProposals
       .filter((proposal) => proposal.agentId !== reviewer.id)

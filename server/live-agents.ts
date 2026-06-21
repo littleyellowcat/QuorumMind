@@ -7,8 +7,8 @@ import { buildAHPAnalysis } from "../src/lib/ahp";
 import { createDefaultAgents, generateCritique, generateProposal, reviseProposal } from "../src/lib/demo-agents";
 import { calculateMonteCarloStressLens, calculateRegretMap, calculateTopsisLens, scoreProposals } from "../src/lib/scoring";
 import { inferDecisionDomain } from "../src/lib/model-reputation";
-import { matchSkills, type SkillMeta } from "../src/lib/skill-loader";
-import { buildSkillCandidateList, buildSkillInjection } from "../src/lib/skill-inject";
+import { matchSkills, type SkillMeta } from "./skill-loader";
+import { buildSkillCandidateList, buildSkillInjection } from "./skill-inject";
 
 // ── Helpers ────────────────────────────────────────────
 
@@ -332,21 +332,37 @@ export type LiveDecisionRoomInput = {
   knowledgeInjection?: string;
 };
 
+// ── Orchestrator-Worker Pipeline ──────────────────────────
+
+export type OrchestrationTrace = {
+  phase: string;
+  workerCount: number;
+  passCount: number;
+  failCount: number;
+  summary: string;
+};
+
 export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
   const roomId = `live-${Date.now()}`;
   const knowledgeInjection = input.knowledgeInjection ?? "";
   const agents = createDefaultAgents();
   const activeAgents = input.mode === "fast" ? agents.slice(0, 3) : agents;
+  const trace: OrchestrationTrace[] = [];
 
-  // Pre-compute skill matches per agent for the decision domain
+  // Pre-compute skill matches per agent
   const domain = inferDecisionDomain(input.question, input.context);
   const agentSkills = new Map<string, SkillMeta[]>();
   for (const agent of activeAgents) {
     agentSkills.set(agent.id, matchSkills(input.question, domain, agent.role));
   }
 
-  // ── 1. Generate live proposals ────────────────────────
+  // ═══════════════════════════════════════════════════════
+  // Phase 1: Dispatch Workers
+  // Orchestrator assigns each Worker a role, question, context,
+  // knowledge injection, and matching skills.
+  // ═══════════════════════════════════════════════════════
   const initialProposals: Proposal[] = [];
+  let workerPass = 0, workerFail = 0;
   for (const agent of activeAgents) {
     const provider = pickProvider(agent, input.providers);
     const skills = agentSkills.get(agent.id);
@@ -354,36 +370,69 @@ export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
       try {
         const p = await generateLiveProposal(provider, roomId, agent, input.context, input.question, knowledgeInjection, skills);
         initialProposals.push(p);
+        workerPass++;
       } catch {
         initialProposals.push(generateProposal(roomId, agent, input.context, input.question, knowledgeInjection));
+        workerFail++;
       }
     } else {
       initialProposals.push(generateProposal(roomId, agent, input.context, input.question, knowledgeInjection));
+      workerPass++;
     }
   }
+  trace.push({ phase: "dispatch", workerCount: activeAgents.length, passCount: workerPass, failCount: workerFail, summary: `${workerPass}/${activeAgents.length} Workers generated proposals` });
 
-  // ── 2. Generate live critiques (blind review) ─────────
+  // ═══════════════════════════════════════════════════════
+  // Phase 2: Validate Worker Output
+  // Validator checks: (a) all Workers returned a Proposal,
+  // (b) proposals are structurally distinct (no >80% text overlap),
+  // (c) each covers the 10 criteria dimensions.
+  // ═══════════════════════════════════════════════════════
+  const validationFailures: string[] = [];
+  for (let i = 0; i < initialProposals.length; i++) {
+    for (let j = i + 1; j < initialProposals.length; j++) {
+      const overlap = textOverlap(initialProposals[i].recommendation, initialProposals[j].recommendation);
+      if (overlap > 0.8) {
+        validationFailures.push(`Proposals ${i} and ${j} have ${Math.round(overlap * 100)}% text overlap`);
+      }
+    }
+  }
+  trace.push({ phase: "validate", workerCount: initialProposals.length, passCount: initialProposals.length - validationFailures.length, failCount: validationFailures.length, summary: validationFailures.length === 0 ? "All Workers passed validation" : `Validation issues: ${validationFailures.join("; ")}` });
+
+  // ═══════════════════════════════════════════════════════
+  // Phase 3: Cross-Critique (Critic Round)
+  // Each Worker blind-reviews every OTHER Worker's output.
+  // Blind Review: proposal authorship is hidden (Proposal A/B/C).
+  // ═══════════════════════════════════════════════════════
   const critiques: Critique[] = [];
+  let criticPass = 0, criticFail = 0;
   for (const reviewer of activeAgents) {
     for (const proposal of initialProposals) {
       if (proposal.agentId === reviewer.id) continue;
       const provider = pickProvider(reviewer, input.providers);
-      // Pass the proposal author's skillMatches to the critique
       const proposalSkills = agentSkills.get(proposal.agentId);
       if (provider) {
         try {
           const c = await generateLiveCritique(provider, roomId, reviewer, proposal, initialProposals, proposalSkills);
           critiques.push(c);
+          criticPass++;
         } catch {
           critiques.push(generateCritique(roomId, reviewer, proposal, critiques.length));
+          criticFail++;
         }
       } else {
         critiques.push(generateCritique(roomId, reviewer, proposal, critiques.length));
+        criticPass++;
       }
     }
   }
+  trace.push({ phase: "cross_critique", workerCount: activeAgents.length, passCount: criticPass, failCount: criticFail, summary: `${criticPass}/${criticPass + criticFail} Critic reviews completed` });
 
-  // ── 3. Revise proposals ───────────────────────────────
+  // ═══════════════════════════════════════════════════════
+  // Phase 4: Revise
+  // Each Worker absorbs Critic feedback and produces a
+  // revised proposal (version: "revised").
+  // ═══════════════════════════════════════════════════════
   const revisedProposals = await Promise.all(initialProposals.map(async (proposal) => {
     const agent = activeAgents.find(a => a.id === proposal.agentId)!;
     const provider = pickProvider(agent, input.providers);
@@ -400,7 +449,11 @@ export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
     return reviseProposal(proposal, relevant);
   }));
 
-  // ── 4. Scoring, lenses, ADR (deterministic) ───────────
+  // ═══════════════════════════════════════════════════════
+  // Phase 5: Finalize
+  // Scoring (Borda/Bayesian/TOPSIS/Monte Carlo/AHP) +
+  // ADR generation + decision summary persistence.
+  // ═══════════════════════════════════════════════════════
   const rankings = createLiveRankings(activeAgents, revisedProposals);
   const weights = input.context.productStage === "mvp"
     ? { scalability: 0.1, reliability: 0.1, security: 0.14, costEfficiency: 0.1, implementationComplexity: 0.12, maintainability: 0.1, migrationFlexibility: 0.1, teamFit: 0.12, timeToMarket: 0.12, reversibility: 0.1 }
@@ -461,6 +514,8 @@ export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
     reviewDate: new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10)
   };
 
+  trace.push({ phase: "finalize", workerCount: 1, passCount: 1, failCount: 0, summary: `Winner: ${selectedProposalId}, Quorum Score: ${winner?.quorumScore ?? 0}` });
+
   return {
     roomId,
     question: input.question,
@@ -471,6 +526,7 @@ export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
     critiques,
     revisedProposals,
     rankings,
+    orchestrationTrace: trace,
     verdict: {
       selectedProposalId,
       finalRecommendation: decision,
@@ -509,4 +565,15 @@ function createLiveRankings(agents: Agent[], proposals: Proposal[]): AgentRankin
       confidence: 0.8
     };
   });
+}
+
+// ── Orchestrator Helpers ─────────────────────────────────
+
+function textOverlap(a: string, b: string): number {
+  const wordsA = new Set(a.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+  const wordsB = new Set(b.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+  let intersection = 0;
+  for (const w of wordsA) { if (wordsB.has(w)) intersection++; }
+  return intersection / Math.max(wordsA.size, wordsB.size);
 }

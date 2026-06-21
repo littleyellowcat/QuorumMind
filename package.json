@@ -4,22 +4,40 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "dev": "node scripts/dev.mjs",
+    "dev:web": "vite",
+    "dev:docker": "QUORUMMIND_API_HOST=0.0.0.0 QUORUMMIND_WEB_HOST=0.0.0.0 node scripts/dev.mjs",
+    "server": "tsx server/index.ts",
+    "build": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit && vite build",
+    "mock:e2e": "tsx scripts/mock-e2e.ts",
+    "quality:audit": "tsx scripts/system-quality-audit.ts",
+    "quality:live": "tsx scripts/live-model-quality-audit.ts",
+    "quality:blueprint:live": "tsx scripts/live-blueprint-quality-audit.ts",
+    "quality:live:expanded": "QUORUMMIND_LIVE_AUDIT_SUITE=expanded tsx scripts/live-model-quality-audit.ts",
+    "quality:live:full": "QUORUMMIND_LIVE_AUDIT_SUITE=full tsx scripts/live-model-quality-audit.ts",
+    "visual:audit": "tsx scripts/visual-audit.ts",
     "preview": "vite preview",
-    "test": "vitest --passWithNoTests"
+    "test": "vitest --passWithNoTests",
+    "gc": "tsx server/garbage-collector.ts"
   },
   "dependencies": {
+    "@langchain/core": "1.2.0",
+    "@langchain/langgraph": "1.4.4",
+    "langchain": "1.4.6",
     "react": "19.2.7",
-    "react-dom": "19.2.7"
+    "react-dom": "19.2.7",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "6.9.1",
     "@testing-library/react": "16.3.2",
+    "@types/node": "25.9.3",
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
     "jsdom": "29.1.1",
+    "playwright": "1.61.0",
+    "tsx": "4.22.4",
     "typescript": "6.0.3",
     "vite": "8.0.16",
     "vitest": "4.1.8"

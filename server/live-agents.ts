@@ -6,8 +6,26 @@ import { generateADR } from "../src/lib/adr";
 import { buildAHPAnalysis } from "../src/lib/ahp";
 import { createDefaultAgents, generateCritique, generateProposal, reviseProposal } from "../src/lib/demo-agents";
 import { calculateMonteCarloStressLens, calculateRegretMap, calculateTopsisLens, scoreProposals } from "../src/lib/scoring";
+import { inferDecisionDomain } from "../src/lib/model-reputation";
+import { matchSkills, type SkillMeta } from "../src/lib/skill-loader";
+import { buildSkillCandidateList, buildSkillInjection } from "../src/lib/skill-inject";
 
 // ── Helpers ────────────────────────────────────────────
+
+/**
+ * Parse the LLM's JSON response to extract the `skills_used` field.
+ * Returns an array of skill names, or an empty array if none found.
+ */
+function extractSkillsUsed(text: string): string[] {
+  const parsed = parseProviderJson(text);
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const skillsUsed = (parsed as Record<string, unknown>)["skills_used"];
+    if (Array.isArray(skillsUsed) && skillsUsed.every((s) => typeof s === "string")) {
+      return skillsUsed as string[];
+    }
+  }
+  return [];
+}
 
 function buildLiveRequest(
   provider: ModelProvider,
@@ -63,23 +81,42 @@ export async function generateLiveProposal(
   agent: Agent,
   context: DecisionContext,
   question = "",
-  knowledgeInjection = ""
+  knowledgeInjection = "",
+  skillMatches?: SkillMeta[]
 ): Promise<Proposal> {
-  const enhancedQuestion = knowledgeInjection
-    ? `${knowledgeInjection}\n\n---\n\n${question}`
-    : question;
+  const domain = inferDecisionDomain(question, context);
+  const matched = skillMatches ?? matchSkills(question, domain, agent.role);
+  const skillCandidateList = buildSkillCandidateList(matched);
+  const enhancedQuestion = [knowledgeInjection, skillCandidateList, question]
+    .filter(Boolean)
+    .join("\n\n");
 
   const text = await buildLiveRequest(provider, "proposal", agent, enhancedQuestion, context, "en");
+
+  // Extract skills_used from LLM response and build skill injection
+  const skillsUsed = extractSkillsUsed(text);
+  const skillInjection = skillsUsed.length > 0
+    ? buildSkillInjection(skillsUsed, matched)
+    : "";
+
   const parsed = parseProviderJson(text);
   const schema = parsed !== undefined
     ? normalizeProviderPayload("proposal", parsed)
     : null;
 
   if (schema?.ok && schema.normalized) {
-    return mapToProposal(schema.normalized as NormalizedProviderProposal, roomId, agent);
+    const proposal = mapToProposal(schema.normalized as NormalizedProviderProposal, roomId, agent);
+    if (skillInjection) {
+      proposal.reasoning = skillInjection + "\n\n" + proposal.reasoning;
+    }
+    return proposal;
   }
 
   // Fallback: return a minimal proposal with the raw text
+  const fallbackReasoning = skillInjection
+    ? skillInjection + "\n\n" + text.slice(0, 1000)
+    : text.slice(0, 1000);
+
   return {
     id: `${agent.id}-proposal-initial`,
     roomId,
@@ -87,7 +124,7 @@ export async function generateLiveProposal(
     title: "Live proposal (unparsed)",
     recommendation: text.slice(0, 500),
     alternatives: [],
-    reasoning: text.slice(0, 1000),
+    reasoning: fallbackReasoning,
     strengths: [],
     weaknesses: [],
     assumptions: [],
@@ -110,7 +147,8 @@ export async function generateLiveCritique(
   roomId: string,
   reviewer: Agent,
   targetProposal: Proposal,
-  allProposals: Proposal[]
+  allProposals: Proposal[],
+  skillMatches?: SkillMeta[]
 ): Promise<Critique> {
   // Build blind-review payload from all proposals
   const blindProposals = allProposals.map((p, i) => ({
@@ -133,10 +171,19 @@ export async function generateLiveCritique(
     targetProposalId: targetProposal.id
   };
 
+  // Reuse proposal-phase skillMatches and add review-specific skills
+  const reviewSkills = (skillMatches ?? []).filter(s =>
+    s.triggers.some(t => ["review", "critique", "audit", "评审"].includes(t))
+  );
+  const reviewCandidateList = buildSkillCandidateList(reviewSkills);
+
   const question = `Critique the proposal with id "${targetProposal.id}". Consider its strengths, weaknesses, hidden risks, and missing considerations.`;
+  const enhancedQuestion = reviewCandidateList
+    ? reviewCandidateList + "\n\n" + question
+    : question;
 
   const text = await buildLiveRequest(
-    provider, "critique", reviewer, question,
+    provider, "critique", reviewer, enhancedQuestion,
     targetProposal as unknown as DecisionContext,
     "en", payload
   );
@@ -181,11 +228,23 @@ export async function reviseLiveProposal(
   roomId: string,
   agent: Agent,
   proposal: Proposal,
-  critiques: Critique[]
+  critiques: Critique[],
+  skillMatches?: SkillMeta[]
 ): Promise<Proposal> {
   const suggestions = critiques
     .flatMap(c => c.improvementSuggestions)
     .filter(Boolean);
+
+  // Build critique-aware skill enhancement: if critiques mention
+  // specific domains, load additional skills for those areas.
+  const critiqueText = critiques
+    .map(c => `${c.strongestArgument} ${c.weakestAssumption} ${c.hiddenRisks.join(" ")} ${c.missingConsiderations.join(" ")}`)
+    .join(" ");
+  const extraSkills = (skillMatches ?? []).filter(s =>
+    s.triggers.length === 0 ||
+    s.triggers.some(t => critiqueText.toLowerCase().includes(t.toLowerCase()))
+  );
+  const revisionCandidateList = buildSkillCandidateList(extraSkills);
 
   const payload = {
     originalProposal: proposal,
@@ -198,12 +257,22 @@ export async function reviseLiveProposal(
   };
 
   const question = `Revise your proposal based on the critiques. Address the improvement suggestions and strengthen weak areas.`;
+  const enhancedQuestion = revisionCandidateList
+    ? revisionCandidateList + "\n\n" + question
+    : question;
 
   const text = await buildLiveRequest(
-    provider, "revision", agent, question,
+    provider, "revision", agent, enhancedQuestion,
     proposal as unknown as DecisionContext,
     "en", payload
   );
+
+  // Extract skills_used from LLM response for the revision round
+  const skillsUsed = extractSkillsUsed(text);
+  const revisionSkills = [...(skillMatches ?? []), ...extraSkills];
+  const skillInjection = skillsUsed.length > 0
+    ? buildSkillInjection(skillsUsed, revisionSkills)
+    : "";
 
   const parsed = parseProviderJson(text);
   const schema = parsed !== undefined
@@ -212,11 +281,14 @@ export async function reviseLiveProposal(
 
   if (schema?.ok && schema.normalized) {
     const n = schema.normalized as NormalizedProviderProposal;
+    const revisedReasoning = skillInjection
+      ? skillInjection + "\n\n" + n.recommendation
+      : n.recommendation;
     return {
       ...proposal,
       id: `${agent.id}-proposal-revised`,
       recommendation: n.recommendation,
-      reasoning: n.recommendation,
+      reasoning: revisedReasoning,
       criteriaScores: n.criteriaScores,
       regretByScenario: n.regretByScenario,
       confidence: Math.min(0.95, n.confidence + 0.03),
@@ -266,13 +338,21 @@ export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
   const agents = createDefaultAgents();
   const activeAgents = input.mode === "fast" ? agents.slice(0, 3) : agents;
 
+  // Pre-compute skill matches per agent for the decision domain
+  const domain = inferDecisionDomain(input.question, input.context);
+  const agentSkills = new Map<string, SkillMeta[]>();
+  for (const agent of activeAgents) {
+    agentSkills.set(agent.id, matchSkills(input.question, domain, agent.role));
+  }
+
   // ── 1. Generate live proposals ────────────────────────
   const initialProposals: Proposal[] = [];
   for (const agent of activeAgents) {
     const provider = pickProvider(agent, input.providers);
+    const skills = agentSkills.get(agent.id);
     if (provider) {
       try {
-        const p = await generateLiveProposal(provider, roomId, agent, input.context, input.question, knowledgeInjection);
+        const p = await generateLiveProposal(provider, roomId, agent, input.context, input.question, knowledgeInjection, skills);
         initialProposals.push(p);
       } catch {
         initialProposals.push(generateProposal(roomId, agent, input.context, input.question, knowledgeInjection));
@@ -288,9 +368,11 @@ export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
     for (const proposal of initialProposals) {
       if (proposal.agentId === reviewer.id) continue;
       const provider = pickProvider(reviewer, input.providers);
+      // Pass the proposal author's skillMatches to the critique
+      const proposalSkills = agentSkills.get(proposal.agentId);
       if (provider) {
         try {
-          const c = await generateLiveCritique(provider, roomId, reviewer, proposal, initialProposals);
+          const c = await generateLiveCritique(provider, roomId, reviewer, proposal, initialProposals, proposalSkills);
           critiques.push(c);
         } catch {
           critiques.push(generateCritique(roomId, reviewer, proposal, critiques.length));
@@ -306,9 +388,11 @@ export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
     const agent = activeAgents.find(a => a.id === proposal.agentId)!;
     const provider = pickProvider(agent, input.providers);
     const relevant = critiques.filter(c => c.targetProposalId === proposal.id);
+    // Pass the original agent's skillMatches to the revision
+    const skills = agentSkills.get(proposal.agentId);
     if (provider) {
       try {
-        return await reviseLiveProposal(provider, roomId, agent, proposal, relevant);
+        return await reviseLiveProposal(provider, roomId, agent, proposal, relevant, skills);
       } catch {
         return reviseProposal(proposal, relevant);
       }

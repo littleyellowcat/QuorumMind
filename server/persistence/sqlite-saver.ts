@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS langgraph_checkpoints (
   thread_id TEXT NOT NULL,
   checkpoint_id TEXT NOT NULL,
   parent_checkpoint_id TEXT,
+  checkpoint_ns TEXT NOT NULL DEFAULT '',
   checkpoint_data TEXT NOT NULL,
   metadata_json TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -62,7 +63,7 @@ class SqliteSaver extends BaseCheckpointSaver {
     if (checkpointId) {
       row = this.#db
         .prepare(
-          `SELECT checkpoint_data, metadata_json, parent_checkpoint_id
+          `SELECT checkpoint_data, metadata_json, parent_checkpoint_id, checkpoint_ns
            FROM langgraph_checkpoints
            WHERE thread_id = ? AND checkpoint_id = ?`
         )
@@ -70,7 +71,7 @@ class SqliteSaver extends BaseCheckpointSaver {
     } else {
       row = this.#db
         .prepare(
-          `SELECT checkpoint_data, metadata_json, parent_checkpoint_id
+          `SELECT checkpoint_data, metadata_json, parent_checkpoint_id, checkpoint_ns
            FROM langgraph_checkpoints
            WHERE thread_id = ?
            ORDER BY created_at DESC LIMIT 1`
@@ -85,10 +86,13 @@ class SqliteSaver extends BaseCheckpointSaver {
 
     const pendingWrites = this.#loadPendingWrites(threadId, resolvedCheckpointId);
 
+    const checkpointNs = row.checkpoint_ns as string | undefined ?? "";
+
     const tuple: CheckpointTuple = {
       config: {
         configurable: {
           thread_id: threadId,
+          checkpoint_ns: checkpointNs,
           checkpoint_id: resolvedCheckpointId
         }
       },
@@ -102,6 +106,7 @@ class SqliteSaver extends BaseCheckpointSaver {
       tuple.parentConfig = {
         configurable: {
           thread_id: threadId,
+          checkpoint_ns: checkpointNs,
           checkpoint_id: parentId
         }
       };
@@ -126,16 +131,19 @@ class SqliteSaver extends BaseCheckpointSaver {
     const preparedCheckpoint = copyCheckpoint(checkpoint);
     const parentCheckpointId = config.configurable?.checkpoint_id ?? null;
 
+    const checkpointNs = config.configurable?.checkpoint_ns ?? "";
+
     this.#db
       .prepare(
         `INSERT OR REPLACE INTO langgraph_checkpoints
-         (thread_id, checkpoint_id, parent_checkpoint_id, checkpoint_data, metadata_json)
-         VALUES (?, ?, ?, ?, ?)`
+         (thread_id, checkpoint_id, parent_checkpoint_id, checkpoint_ns, checkpoint_data, metadata_json)
+         VALUES (?, ?, ?, ?, ?, ?)`
       )
       .run(
         threadId,
         preparedCheckpoint.id,
         parentCheckpointId,
+        checkpointNs,
         JSON.stringify(preparedCheckpoint),
         JSON.stringify(metadata)
       );
@@ -143,6 +151,7 @@ class SqliteSaver extends BaseCheckpointSaver {
     return {
       configurable: {
         thread_id: threadId,
+        checkpoint_ns: checkpointNs,
         checkpoint_id: preparedCheckpoint.id
       }
     };
@@ -158,10 +167,10 @@ class SqliteSaver extends BaseCheckpointSaver {
     const limit = options?.limit;
     const beforeId = options?.before?.configurable?.checkpoint_id;
 
-    let sql = `SELECT checkpoint_data, metadata_json, parent_checkpoint_id, checkpoint_id
+    let sql = `SELECT checkpoint_data, metadata_json, parent_checkpoint_id, checkpoint_id, checkpoint_ns
                FROM langgraph_checkpoints
                WHERE thread_id = ?`;
-    const params: unknown[] = [threadId];
+    const params: (string | number | null)[] = [threadId as string];
 
     if (beforeId) {
       sql += ` AND created_at < (SELECT created_at FROM langgraph_checkpoints WHERE thread_id = ? AND checkpoint_id = ?)`;
@@ -175,15 +184,17 @@ class SqliteSaver extends BaseCheckpointSaver {
       params.push(limit);
     }
 
-    const rows = this.#db.prepare(sql).all(...params) as Record<string, unknown>[];
+    const rows = this.#db.prepare(sql).all(...params as any) as Record<string, unknown>[];
 
     for (const row of rows) {
       const cpId = row.checkpoint_id as string;
+      const checkpointNs = row.checkpoint_ns as string | undefined ?? "";
 
       const tuple: CheckpointTuple = {
         config: {
           configurable: {
             thread_id: threadId,
+            checkpoint_ns: checkpointNs,
             checkpoint_id: cpId
           }
         },
@@ -197,6 +208,7 @@ class SqliteSaver extends BaseCheckpointSaver {
         tuple.parentConfig = {
           configurable: {
             thread_id: threadId,
+            checkpoint_ns: checkpointNs,
             checkpoint_id: parentId
           }
         };

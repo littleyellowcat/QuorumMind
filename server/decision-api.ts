@@ -1,5 +1,7 @@
 import { runDecisionRoom } from "../src/lib/workflow";
 import { persistDecisionSummary } from "./decision-summarizer";
+import { buildKnowledgeInjection } from "./knowledge-inject";
+import { runLiveDecisionRoom } from "./live-agents";
 import { enrichBlueprintWithModelContributions, runBlueprintRoom } from "../src/lib/blueprint";
 import type { AgentRole, DecisionContext, DecisionMode } from "../src/lib/domain";
 import { decisionContextSchema, decisionModeSchema } from "../src/lib/domain";
@@ -185,11 +187,10 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
     question,
     context
   }, reputationFeedback);
-  const result = runDecisionRoom({
-    question,
-    mode,
-    context
-  });
+  const knowledgeInjection = buildKnowledgeInjection(question, context);
+  const result = shouldUseLiveProviders
+    ? await runLiveDecisionRoom({ question, mode, context, providers, locale, knowledgeInjection })
+    : runDecisionRoom({ question, mode, context, knowledgeInjection });
 
   // Fire-and-forget: persist decision summary to ~/.quorummind/decisions/
   try {

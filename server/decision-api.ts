@@ -12,6 +12,7 @@ import {
 } from "../src/lib/manual-provider";
 import { applyModelReputation, type DecisionDomain, type ModelReputationFeedback } from "../src/lib/model-reputation";
 import { runAutonomousBlueprintGraph } from "./agent-platform/autonomous-blueprint";
+import { GraphInterrupt } from "@langchain/langgraph";
 import { aggregateLiveVerdict } from "./live-aggregation";
 import { runLiveDecisionTrace } from "./live-decision";
 import { createSqliteDecisionRepository } from "./persistence/sqlite-repository";
@@ -348,44 +349,74 @@ async function handleAutonomousBlueprintRequest(request: Request, env: Env): Pro
     context
   }, reputationFeedback);
   const blueprintQuestion = blueprintProviderQuestion(question, locale);
-  const run = await runAutonomousBlueprintGraph({
-    question,
-    mode,
-    locale,
-    context,
-    liveModel:
-      blueprintRuntime.executionMode === "live"
-        ? {
-            requested: true,
-            unavailableReason:
-              requestedProviderMode !== "live"
-                ? "provider_mode_demo"
-                : providers.length === 0
-                  ? "no_configured_providers"
-                  : undefined,
-            runner: shouldUseLiveProviders
-              ? () =>
-                  runLiveDecisionTrace({
-                    providers,
-                    question: blueprintQuestion,
-                    locale: locale,
-                    mode: mode === "fast" ? "deep" : mode,
-                    maxPhases: blueprintRuntime.maxProviderRounds,
-                    agentConfig: reputationAdjustedAgents,
-                    context: context
-                  })
-              : undefined
-          }
-        : { requested: false, unavailableReason: "deterministic_mode" },
-    ...parseAgentRuntimeConfig(payload.agentRuntime)
-  });
+  const agentRuntime = parseAgentRuntimeConfig(payload.agentRuntime);
 
-  return json(request, env, {
-    providerMode: run.liveModel.liveTraceAttempted ? "live" : "demo",
-    providerStatus: getProviderStatus(env),
-    persistence: persistenceStatusForEnv(env),
-    run
-  });
+  try {
+    const run = await runAutonomousBlueprintGraph({
+      question,
+      mode,
+      locale,
+      context,
+      liveModel:
+        blueprintRuntime.executionMode === "live"
+          ? {
+              requested: true,
+              unavailableReason:
+                requestedProviderMode !== "live"
+                  ? "provider_mode_demo"
+                  : providers.length === 0
+                    ? "no_configured_providers"
+                    : undefined,
+              runner: shouldUseLiveProviders
+                ? () =>
+                    runLiveDecisionTrace({
+                      providers,
+                      question: blueprintQuestion,
+                      locale: locale,
+                      mode: mode === "fast" ? "deep" : mode,
+                      maxPhases: blueprintRuntime.maxProviderRounds,
+                      agentConfig: reputationAdjustedAgents,
+                      context: context
+                    })
+                : undefined
+            }
+          : { requested: false, unavailableReason: "deterministic_mode" },
+      ...agentRuntime
+    });
+
+    return json(request, env, {
+      providerMode: run.liveModel.liveTraceAttempted ? "live" : "demo",
+      providerStatus: getProviderStatus(env),
+      persistence: persistenceStatusForEnv(env),
+      run
+    });
+  } catch (error) {
+    if (error instanceof GraphInterrupt) {
+      // Human-in-the-loop: the graph paused at human_review_gate.
+      // Return the interrupt payload so the user can review and resume.
+      const interrupts = (error as any).interrupts ?? [];
+      return json(request, env, {
+        status: "paused_for_review",
+        message:
+          locale === "zh"
+            ? "蓝图共识低于阈值，需要人工复审。请提供复审意见后重新提交。"
+            : "Blueprint consensus is below threshold. Human review required.",
+        threadId: agentRuntime.threadId ?? "quorummind-agent-thread",
+        interrupts: interrupts.map((i: any) => ({
+          gate: i.value?.gate ?? "human_review",
+          consensusScore: i.value?.consensus_score,
+          round: i.value?.round,
+          blockingIssues: i.value?.blocking_issues ?? [],
+          reviewWarnings: i.value?.review_warnings ?? []
+        })),
+        resumeHint:
+          locale === "zh"
+            ? `发送 POST /api/agent-runs/blueprint 并在 agentRuntime.humanReviewNote 中填写复审意见以继续。`
+            : `POST /api/agent-runs/blueprint with agentRuntime.humanReviewNote set to your review to resume.`
+      }, 200);
+    }
+    throw error;
+  }
 }
 
 function blueprintProviderQuestion(question: string, locale: "en" | "zh"): string {

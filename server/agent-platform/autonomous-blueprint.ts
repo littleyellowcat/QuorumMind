@@ -1,4 +1,4 @@
-import { Annotation, END, MemorySaver, START, StateGraph } from "@langchain/langgraph";
+import { Annotation, Command, END, MemorySaver, START, StateGraph, interrupt } from "@langchain/langgraph";
 import { createSqliteSaver } from "../persistence/sqlite-saver";
 import { DatabaseSync } from "node:sqlite";
 import { tool } from "@langchain/core/tools";
@@ -10,7 +10,7 @@ import {
 } from "../../src/lib/blueprint";
 import type { DecisionContext, DecisionMode } from "../../src/lib/domain";
 import type { LiveDecisionTraceEntry } from "../live-decision";
-import { buildKnowledgeInjection } from "../../src/lib/knowledge-inject";
+import { buildKnowledgeInjection } from "../knowledge-inject";
 import {
   compressContext,
   estimateTokenCount,
@@ -1072,23 +1072,48 @@ function humanReviewGateNode(state: AutonomousBlueprintGraphState): AutonomousBl
   const validation = requireValidation(state);
   const humanReviewNote = typeof state.humanReviewNote === "string" && state.humanReviewNote.trim() ? state.humanReviewNote.trim() : undefined;
 
+  // Human-in-the-loop: pause execution if no review note is provided.
+  // The graph checkpoints here. Resume with Command({ resume: "review text" }).
+  if (!humanReviewNote) {
+    const resumeValue = interrupt({
+      gate: "human_review",
+      thread_id: state.agentThreadId,
+      consensus_score: validation.consensusScore,
+      consensus_passed: validation.passed,
+      round: validation.round,
+      blocking_issues: validation.blockingIssues,
+      review_warnings: validation.reviewWarnings,
+      message:
+        state.locale === "zh"
+          ? "蓝图共识已低于阈值。请提供人工复审意见以继续，或发送空字符串跳过。"
+          : "Blueprint consensus is below threshold. Provide a human review note to continue, or send an empty string to skip."
+    });
+
+    if (typeof resumeValue === "string" && resumeValue.trim()) {
+      state.humanReviewNote = resumeValue.trim();
+    }
+  }
+
+  const resolvedNote = state.humanReviewNote;
+
   return {
+    humanReviewNote: resolvedNote,
     trace: [
       {
         node: "human_review_gate",
         agentId: "human-review-gate",
-        status: humanReviewNote ? "complete" : "needs_review",
+        status: resolvedNote ? "complete" : "skipped",
         summary:
           state.locale === "zh"
-            ? humanReviewNote
-              ? "已读取人工复审输入，并把它作为本次 checkpoint thread 的恢复证据。"
-              : "已进入人工复审门禁，等待补充证据或继续一轮 agent 讨论。"
-            : humanReviewNote
-              ? "Read human review input and attached it as resume evidence for this checkpoint thread."
-              : "Entered the human-review gate and awaits more evidence or another agent round.",
+            ? resolvedNote
+              ? `人工复审已通过: ${resolvedNote.slice(0, 100)}`
+              : "人工复审门禁已跳过（无复审输入）。"
+            : resolvedNote
+              ? `Human review accepted: ${resolvedNote.slice(0, 100)}`
+              : "Human review gate skipped (no review input).",
         evidence: [
-          ...(validation.blockingIssues.length > 0 ? validation.blockingIssues : validation.reviewWarnings),
-          ...(humanReviewNote ? [humanReviewNote] : [])
+          ...validation.blockingIssues,
+          ...(resolvedNote ? [resolvedNote] : [])
         ]
       }
     ]

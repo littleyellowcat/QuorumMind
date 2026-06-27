@@ -1,0 +1,4 @@
+interface:
+  display_name: "QuorumMind Blueprint Planner"
+  short_description: "Turn open-ended requests into complete implementation blueprints."
+  default_prompt: "Use $quorummind-blueprint-planner to produce a detailed blueprint with workflow, schemas, agents/modules, risks, milestones, and backlog."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "QuorumMind Security Guard"
+  short_description: "Review API tokens, CORS, rate limits, request size, logs, provider keys, and export safety."
+  default_prompt: "Use $quorummind-security-guard to harden QuorumMind API, provider, logging, and export behavior."

@@ -52,6 +52,9 @@ export function buildSystemPrompt(request: ProviderRequest): string {
     ...blindReviewInstructions,
     ...roleInstructions,
     "Return concise JSON only. The response must be a valid json object. Do not include markdown fences.",
+    "Use the canonical field names shown in the schema exactly. Do not substitute aliases such as id, decision, answer, risks, ranking, or snake_case field names.",
+    "Before returning, self-check that the JSON parses, contains every required canonical field for this phase, and uses only proposal ids from the payload when ids are required.",
+    "If the output language is Chinese, every user-facing value in recommendation, reasoning, risks, rationale, critique, verdict, dissent, and suggestions must be Simplified Chinese.",
     "Use scores from 0 to 100 and confidence from 0 to 1.",
     "Return this JSON shape:",
     JSON.stringify(schemaForPhase(request.phase), null, 2)

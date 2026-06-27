@@ -82,7 +82,8 @@ export async function generateLiveProposal(
   context: DecisionContext,
   question = "",
   knowledgeInjection = "",
-  skillMatches?: SkillMeta[]
+  skillMatches?: SkillMeta[],
+  locale: "en" | "zh" = "en"
 ): Promise<Proposal> {
   const domain = inferDecisionDomain(question, context);
   const matched = skillMatches ?? matchSkills(question, domain, agent.role);
@@ -91,7 +92,7 @@ export async function generateLiveProposal(
     .filter(Boolean)
     .join("\n\n");
 
-  const text = await buildLiveRequest(provider, "proposal", agent, enhancedQuestion, context, "en");
+  const text = await buildLiveRequest(provider, "proposal", agent, enhancedQuestion, context, locale);
 
   // Extract skills_used from LLM response and build skill injection
   const skillsUsed = extractSkillsUsed(text);
@@ -148,7 +149,8 @@ export async function generateLiveCritique(
   reviewer: Agent,
   targetProposal: Proposal,
   allProposals: Proposal[],
-  skillMatches?: SkillMeta[]
+  skillMatches?: SkillMeta[],
+  locale: "en" | "zh" = "en"
 ): Promise<Critique> {
   // Build blind-review payload from all proposals
   const blindProposals = allProposals.map((p, i) => ({
@@ -177,7 +179,10 @@ export async function generateLiveCritique(
   );
   const reviewCandidateList = buildSkillCandidateList(reviewSkills);
 
-  const question = `Critique the proposal with id "${targetProposal.id}". Consider its strengths, weaknesses, hidden risks, and missing considerations.`;
+  const question =
+    locale === "zh"
+      ? `请评审 id 为 "${targetProposal.id}" 的方案。重点检查优势、弱点、隐藏风险和缺失考虑。`
+      : `Critique the proposal with id "${targetProposal.id}". Consider its strengths, weaknesses, hidden risks, and missing considerations.`;
   const enhancedQuestion = reviewCandidateList
     ? reviewCandidateList + "\n\n" + question
     : question;
@@ -185,7 +190,7 @@ export async function generateLiveCritique(
   const text = await buildLiveRequest(
     provider, "critique", reviewer, enhancedQuestion,
     targetProposal as unknown as DecisionContext,
-    "en", payload
+    locale, payload
   );
 
   const parsed = parseProviderJson(text);
@@ -229,7 +234,8 @@ export async function reviseLiveProposal(
   agent: Agent,
   proposal: Proposal,
   critiques: Critique[],
-  skillMatches?: SkillMeta[]
+  skillMatches?: SkillMeta[],
+  locale: "en" | "zh" = "en"
 ): Promise<Proposal> {
   const suggestions = critiques
     .flatMap(c => c.improvementSuggestions)
@@ -256,7 +262,10 @@ export async function reviseLiveProposal(
     }))
   };
 
-  const question = `Revise your proposal based on the critiques. Address the improvement suggestions and strengthen weak areas.`;
+  const question =
+    locale === "zh"
+      ? "请根据这些质询修订你的方案。必须回应改进建议，并补强薄弱部分。"
+      : "Revise your proposal based on the critiques. Address the improvement suggestions and strengthen weak areas.";
   const enhancedQuestion = revisionCandidateList
     ? revisionCandidateList + "\n\n" + question
     : question;
@@ -264,7 +273,7 @@ export async function reviseLiveProposal(
   const text = await buildLiveRequest(
     provider, "revision", agent, enhancedQuestion,
     proposal as unknown as DecisionContext,
-    "en", payload
+    locale, payload
   );
 
   // Extract skills_used from LLM response for the revision round
@@ -345,6 +354,7 @@ export type OrchestrationTrace = {
 export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
   const roomId = `live-${Date.now()}`;
   const knowledgeInjection = input.knowledgeInjection ?? "";
+  const locale = input.locale ?? "en";
   const agents = createDefaultAgents();
   const activeAgents = input.mode === "fast" ? agents.slice(0, 3) : agents;
   const trace: OrchestrationTrace[] = [];
@@ -368,7 +378,7 @@ export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
     const skills = agentSkills.get(agent.id);
     if (provider) {
       try {
-        const p = await generateLiveProposal(provider, roomId, agent, input.context, input.question, knowledgeInjection, skills);
+        const p = await generateLiveProposal(provider, roomId, agent, input.context, input.question, knowledgeInjection, skills, locale);
         initialProposals.push(p);
         workerPass++;
       } catch {
@@ -413,7 +423,7 @@ export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
       const proposalSkills = agentSkills.get(proposal.agentId);
       if (provider) {
         try {
-          const c = await generateLiveCritique(provider, roomId, reviewer, proposal, initialProposals, proposalSkills);
+          const c = await generateLiveCritique(provider, roomId, reviewer, proposal, initialProposals, proposalSkills, locale);
           critiques.push(c);
           criticPass++;
         } catch {
@@ -441,7 +451,7 @@ export async function runLiveDecisionRoom(input: LiveDecisionRoomInput) {
     const skills = agentSkills.get(proposal.agentId);
     if (provider) {
       try {
-        return await reviseLiveProposal(provider, roomId, agent, proposal, relevant, skills);
+        return await reviseLiveProposal(provider, roomId, agent, proposal, relevant, skills, locale);
       } catch {
         return reviseProposal(proposal, relevant);
       }

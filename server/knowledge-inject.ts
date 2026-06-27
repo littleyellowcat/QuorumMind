@@ -1,6 +1,6 @@
 import { resolveDataDir, loadIndex, searchIndex } from "./knowledge-index";
-import type { DecisionContext } from "./domain";
-import { inferDecisionDomain } from "./model-reputation";
+import type { DecisionContext } from "../src/lib/domain";
+import { inferDecisionDomain } from "../src/lib/model-reputation";
 
 const MAX_INJECTION_CHARS = 1500; // ~400 tokens
 

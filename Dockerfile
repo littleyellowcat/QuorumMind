@@ -1,0 +1,19 @@
+FROM node:24-bookworm-slim
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . .
+
+ENV QUORUMMIND_PROVIDER_MODE=live
+ENV QUORUMMIND_MOCK_PROVIDERS=1
+ENV QUORUMMIND_API_HOST=0.0.0.0
+ENV QUORUMMIND_API_PORT=8787
+ENV QUORUMMIND_WEB_HOST=0.0.0.0
+ENV QUORUMMIND_SQLITE_PATH=/data/quorummind.db
+
+EXPOSE 5173 8787
+
+CMD ["npm", "run", "dev:docker"]

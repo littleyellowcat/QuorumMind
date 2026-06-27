@@ -1,0 +1,4 @@
+interface:
+  display_name: "QuorumMind Chinese Localization"
+  short_description: "Check Chinese UI, prompts, reports, terminology, and long-text layout."
+  default_prompt: "Use $quorummind-zh-localization to keep QuorumMind Chinese mode consistent, readable, and free of avoidable English."

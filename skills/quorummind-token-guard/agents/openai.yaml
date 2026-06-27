@@ -1,0 +1,7 @@
+interface:
+  display_name: "QuorumMind Token Guard"
+  short_description: "Bounded retries, validation, and source status."
+  default_prompt: "Use $quorummind-token-guard to bound the work, avoid blind retries, validate the result, and report source/fallback status."
+
+policy:
+  allow_implicit_invocation: true

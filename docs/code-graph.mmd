@@ -1,0 +1,32 @@
+flowchart LR
+  User[用户 / 浏览器] --> FE[React 工作台\nsrc/App.tsx]
+  FE --> UI[UI 组件\nsrc/components]
+  FE --> Client[API Client\nsrc/lib/api-client.ts]
+  FE --> Core[前端确定性核心\nsrc/lib/workflow.ts\nsrc/lib/blueprint.ts\nsrc/lib/scoring.ts]
+  FE --> Exporters[导出与报告\nsrc/lib/exporters.ts]
+  FE --> History[浏览器历史与反馈\nsrc/lib/decision-history.ts\nsrc/lib/reputation-feedback.ts]
+
+  Client --> API[本地 Node API\nserver/decision-api.ts]
+  API --> Core
+  API --> Live[真实/Mock 模型编排\nserver/live-decision.ts\nserver/live-agents.ts]
+  API --> Aggregation[模型结果聚合\nserver/live-aggregation.ts]
+  API --> AgentGraph[LangGraph Agent 平台\nserver/agent-platform/autonomous-blueprint.ts]
+  API --> Security[安全网关\nserver/security.ts]
+  API --> Persistence[持久化\nserver/persistence]
+  API --> SkillRuntime[Skill/Knowledge 注入\nserver/skill-loader.ts\nserver/skill-inject.ts\nserver/knowledge-*]
+  API --> Pdf[PDF 渲染\nserver/pdf-export.ts]
+
+  Live --> Providers[Provider Adapters\nserver/providers]
+  Providers --> OpenAI[OpenAI]
+  Providers --> DeepSeek[DeepSeek]
+  Providers --> Gemini[Gemini]
+  Providers --> Mock[Mock Provider]
+
+  AgentGraph --> Core
+  AgentGraph --> Live
+  AgentGraph --> Persistence
+
+  Scripts[质量与回归脚本\nscripts] --> API
+  Scripts --> Core
+  Scripts --> Providers
+  Scripts --> AgentGraph

@@ -1,7 +1,6 @@
 import { runDecisionRoom } from "../src/lib/workflow";
 import { persistDecisionSummary } from "./decision-summarizer";
 import { buildKnowledgeInjection } from "./knowledge-inject";
-import { runLiveDecisionRoom } from "./live-agents";
 import { enrichBlueprintWithModelContributions, runBlueprintRoom } from "../src/lib/blueprint";
 import type { AgentRole, DecisionContext, DecisionMode } from "../src/lib/domain";
 import { decisionContextSchema, decisionModeSchema } from "../src/lib/domain";
@@ -10,14 +9,17 @@ import {
   defaultManualProviderAgents,
   type ManualProviderAgent
 } from "../src/lib/manual-provider";
-import { applyModelReputation, type DecisionDomain, type ModelReputationFeedback } from "../src/lib/model-reputation";
+import { applyModelReputation, inferDecisionDomain, type DecisionDomain, type ModelReputationFeedback } from "../src/lib/model-reputation";
 import { runAutonomousBlueprintGraph } from "./agent-platform/autonomous-blueprint";
 import { GraphInterrupt } from "@langchain/langgraph";
 import { aggregateLiveVerdict } from "./live-aggregation";
 import { runLiveDecisionTrace } from "./live-decision";
+import { renderHtmlToPdf } from "./pdf-export";
 import { createSqliteDecisionRepository } from "./persistence/sqlite-repository";
 import { testProviderConnections } from "./provider-connectivity";
 import { createConfiguredProviders, getProviderStatus, type Env } from "./providers/registry";
+import { buildSkillInjection } from "./skill-inject";
+import { matchSkills, type SkillMeta } from "./skill-loader";
 import {
   apiSecurityPosture,
   applySecurityHeaders,
@@ -92,6 +94,11 @@ const decisionPayloadSchema = z.object({
   })).default([])
 });
 
+const pdfExportPayloadSchema = z.object({
+  html: z.string().min(1).max(220_000),
+  filename: z.string().min(1).max(180).default("quorummind-final-result.pdf")
+});
+
 export async function handleApiRequest(request: Request, env: Env = process.env): Promise<Response> {
   const corsError = validateCors(request, env);
 
@@ -139,6 +146,10 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
       providerStatus: getProviderStatus(env),
       results: await testProviderConnections(env)
     });
+  }
+
+  if (url.pathname === "/api/exports/pdf" && request.method === "POST") {
+    return handlePdfExportRequest(request, env);
   }
 
   if (url.pathname === "/api/rooms" && request.method === "GET") {
@@ -189,17 +200,7 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
     context
   }, reputationFeedback);
   const knowledgeInjection = buildKnowledgeInjection(question, context);
-  const result = shouldUseLiveProviders
-    ? await runLiveDecisionRoom({ question, mode, context, providers, locale, knowledgeInjection })
-    : runDecisionRoom({ question, mode, context, knowledgeInjection });
-
-  // Fire-and-forget: persist decision summary to ~/.quorummind/decisions/
-  try {
-    persistDecisionSummary(result, question, locale);
-  } catch {
-    // silent failure — decision summary is best-effort
-  }
-
+  const result = runDecisionRoom({ question, mode, context, knowledgeInjection });
   const providerTrace = shouldUseLiveProviders
     ? await runLiveDecisionTrace({
         providers,
@@ -216,6 +217,14 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
         context: context
       })
     : null;
+
+  // Fire-and-forget: persist decision summary to ~/.quorummind/decisions/
+  try {
+    persistDecisionSummary(result, question, locale);
+  } catch {
+    // silent failure — decision summary is best-effort
+  }
+
   const promptBundle = createManualProviderBundle({
     question: question,
     locale: locale,
@@ -284,7 +293,7 @@ async function handleBlueprintRequest(request: Request, env: Env): Promise<Respo
     locale,
     context
   });
-  const blueprintQuestion = blueprintProviderQuestion(question, locale);
+  const blueprintQuestion = blueprintProviderQuestion(question, locale, blueprintSkillContext(question, context));
   const providerTrace = shouldUseLiveProviders
     ? await runLiveDecisionTrace({
         providers,
@@ -321,6 +330,46 @@ async function handleBlueprintRequest(request: Request, env: Env): Promise<Respo
   });
 }
 
+async function handlePdfExportRequest(request: Request, env: Env): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = pdfExportPayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid PDF export request: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  try {
+    const pdf = await renderHtmlToPdf(parsed.data.html);
+    const filename = safePdfFilename(parsed.data.filename);
+    const headers = applySecurityHeaders(
+      new Headers({
+        "Content-Type": "application/pdf",
+        "Content-Disposition": attachmentDisposition(filename)
+      }),
+      request,
+      env
+    );
+
+    const body = new ArrayBuffer(pdf.byteLength);
+    new Uint8Array(body).set(pdf);
+
+    return new Response(body, { status: 200, headers });
+  } catch (error) {
+    return json(request, env, {
+      error: `PDF rendering failed: ${error instanceof Error ? error.message : "Unknown rendering error"}`
+    }, 500);
+  }
+}
+
 async function handleAutonomousBlueprintRequest(request: Request, env: Env): Promise<Response> {
   let payload: DecisionPayload;
 
@@ -348,7 +397,7 @@ async function handleAutonomousBlueprintRequest(request: Request, env: Env): Pro
     question,
     context
   }, reputationFeedback);
-  const blueprintQuestion = blueprintProviderQuestion(question, locale);
+  const blueprintQuestion = blueprintProviderQuestion(question, locale, blueprintSkillContext(question, context));
   const agentRuntime = parseAgentRuntimeConfig(payload.agentRuntime);
 
   try {
@@ -419,10 +468,30 @@ async function handleAutonomousBlueprintRequest(request: Request, env: Env): Pro
   }
 }
 
-function blueprintProviderQuestion(question: string, locale: "en" | "zh"): string {
+function blueprintProviderQuestion(question: string, locale: "en" | "zh", skillContext = ""): string {
+  const skillInstruction =
+    skillContext.length > 0
+      ? locale === "zh"
+        ? `\n\n项目方法论技能（必须吸收进蓝图，不要逐字复述）：\n${skillContext}`
+        : `\n\nProject methodology skills to incorporate without copying verbatim:\n${skillContext}`
+      : "";
+
   return locale === "zh"
-    ? `请为下面这个开放式需求创建、互评并修订一份完整实施蓝图。不要只给概要，要按多轮共识流程回答：第 1 轮各模型/Agent 独立给方案；第 2 轮互相质询和挑刺；第 3 轮吸收质询后修订；如共识未达到 80%，继续说明还需要怎样复核。必须覆盖：目标输出、目标系统 Agent 分工、Agent 之间如何互相提问和挑刺、数据 Schema、工作流、人工复审、实施里程碑、验收标准、风险、待确认问题、共识阈值、剩余分歧、终局评估矩阵，以及非常详细的下一步优化建议。每条建议要包含负责方、原因、行动清单、预期影响和验收检查。最后补一份 issue 级实施任务清单，每个任务包含优先级、负责方、预估、依赖、交付物、验收标准和跳过风险。需求：${question}`
-    : `Create, critique, and revise a complete implementation blueprint for this open-ended request. Do not provide only a summary. Use a multi-round consensus process: round 1 independent model/agent proposals, round 2 cross-critiques, round 3 revised proposals, and if consensus is below 80%, explain the next verification needed. Cover target outputs, target-system agent responsibilities, how agents question and critique each other, data schemas, workflow, human review, milestones, acceptance criteria, risks, open questions, consensus threshold, remaining disagreements, final evaluation matrix, and very detailed next-step recommendations. Each recommendation needs owner, reason, action list, expected impact, and acceptance check. Finish with an issue-level implementation backlog; each task needs priority, owner, effort, dependencies, deliverables, acceptance criteria, and risk if skipped. Request: ${question}`;
+    ? `请为下面这个开放式需求创建、互评并修订一份完整实施蓝图。不要只给概要，要按多轮共识流程回答：第 1 轮各模型/Agent 独立给方案；第 2 轮互相质询和挑刺；第 3 轮吸收质询后修订；如共识未达到 80%，继续说明还需要怎样复核。必须覆盖：目标输出、目标系统 Agent 分工、Agent 之间如何互相提问和挑刺、数据 Schema、工作流、人工复审、实施里程碑、验收标准、风险、待确认问题、共识阈值、剩余分歧、终局评估矩阵，以及非常详细的下一步优化建议。每条建议要包含负责方、原因、行动清单、预期影响和验收检查。最后补一份 issue 级实施任务清单，每个任务包含优先级、负责方、预估、依赖、交付物、验收标准和跳过风险。${skillInstruction}\n\n需求：${question}`
+    : `Create, critique, and revise a complete implementation blueprint for this open-ended request. Do not provide only a summary. Use a multi-round consensus process: round 1 independent model/agent proposals, round 2 cross-critiques, round 3 revised proposals, and if consensus is below 80%, explain the next verification needed. Cover target outputs, target-system agent responsibilities, how agents question and critique each other, data schemas, workflow, human review, milestones, acceptance criteria, risks, open questions, consensus threshold, remaining disagreements, final evaluation matrix, and very detailed next-step recommendations. Each recommendation needs owner, reason, action list, expected impact, and acceptance check. Finish with an issue-level implementation backlog; each task needs priority, owner, effort, dependencies, deliverables, acceptance criteria, and risk if skipped.${skillInstruction}\n\nRequest: ${question}`;
+}
+
+function blueprintSkillContext(question: string, context: DecisionContext): string {
+  const domain = inferDecisionDomain(question, context);
+  const matches = matchSkills(question, domain, "principal_architect")
+    .filter(isBlueprintSkill)
+    .slice(0, 4);
+
+  return buildSkillInjection(matches.map((skill) => skill.name), matches);
+}
+
+function isBlueprintSkill(skill: SkillMeta): boolean {
+  return skill.inject === "blueprint" || skill.inject === "both";
 }
 
 
@@ -662,6 +731,24 @@ function persistDecisionRoomIfConfigured(
   } finally {
     repository.close();
   }
+}
+
+function safePdfFilename(value: string): string {
+  const cleaned = value
+    .trim()
+    .replace(/[\/\\?%*:|"<>]/g, "-")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replace(/\s+/g, "-")
+    .slice(0, 160);
+  const fallback = cleaned || "quorummind-final-result.pdf";
+
+  return fallback.toLowerCase().endsWith(".pdf") ? fallback : `${fallback}.pdf`;
+}
+
+function attachmentDisposition(filename: string): string {
+  const asciiFallback = filename.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "");
+
+  return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
 }
 
 function json(request: Request, env: Env, body: unknown, status = 200): Response {

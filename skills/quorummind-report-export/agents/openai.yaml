@@ -1,0 +1,4 @@
+interface:
+  display_name: "QuorumMind Report Export"
+  short_description: "Keep ADR, blueprint, professional, and simple PDF exports aligned with the current result."
+  default_prompt: "Use $quorummind-report-export to shape export content for the right audience and prevent stale or overly complex reports."

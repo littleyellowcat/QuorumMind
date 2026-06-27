@@ -1,0 +1,4 @@
+interface:
+  display_name: "QuorumMind Decision Review"
+  short_description: "Review decisions with tradeoffs, ADR structure, consensus, and dissent."
+  default_prompt: "Use $quorummind-decision-review to turn a decision question into a reviewable tradeoff analysis and ADR-ready recommendation."

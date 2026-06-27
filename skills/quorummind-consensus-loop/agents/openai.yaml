@@ -1,0 +1,4 @@
+interface:
+  display_name: "QuorumMind Consensus Loop"
+  short_description: "Run independent proposals, blind critique, revision, ranking, and threshold finalization."
+  default_prompt: "Use $quorummind-consensus-loop to coordinate multi-model critique and revision until consensus or human review."

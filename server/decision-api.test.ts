@@ -76,6 +76,42 @@ describe("handleApiRequest", () => {
     expect(body.promptBundle.prompts[0].prompt).toContain("完整实施蓝图");
   });
 
+  it("keeps non-game multi-agent blueprint API requests grounded in the current question", async () => {
+    const question =
+      "我想做一个面向中小跨境电商团队的 AI 运营助手。它需要根据店铺订单、商品库存、广告投放数据和客服对话，自动生成每日运营简报，并给出补货建议、广告预算调整建议、差评处理优先级和客服话术优化方案。请设计 Agent 分工、数据流、Schema、风险控制、MVP 路线和评估指标。";
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/blueprints", {
+        method: "POST",
+        body: JSON.stringify({
+          question,
+          mode: "deep",
+          locale: "zh",
+          context,
+          blueprintRuntime: {
+            executionMode: "deterministic",
+            maxProviderRounds: 2
+          }
+        })
+      }),
+      { QUORUMMIND_PROVIDER_MODE: "demo" }
+    );
+
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.result.finalSpec.title).toContain("跨境电商");
+    expect(body.result.finalSpec.title).toContain("AI 运营助手");
+    expect(body.result.finalSpec.workflowStages).toHaveLength(6);
+    expect(body.result.finalSpec.schemas.map((schema: { name: string }) => schema.name)).toContain("RecommendationItem");
+    expect(body.result.finalSpec.markdown).toContain("订单数据");
+    expect(body.result.finalSpec.markdown).toContain("库存数据");
+    expect(body.result.finalSpec.markdown).toContain("广告投放数据");
+    expect(body.result.finalSpec.markdown).toContain("客服对话");
+    expect(body.result.finalSpec.markdown).not.toContain("视觉小说");
+    expect(body.result.finalSpec.markdown).not.toContain("章节解析");
+    expect(body.result.finalSpec.markdown).not.toContain("CharacterCard");
+  });
+
   it("returns an autonomous LangGraph blueprint run with live fallback evidence when providers are unavailable", async () => {
     const response = await handleApiRequest(
       new Request("http://127.0.0.1:8787/api/agent-runs/blueprint", {
@@ -116,6 +152,54 @@ describe("handleApiRequest", () => {
     expect(body.run.toolCalls.map((entry: { toolName: string }) => entry.toolName)).toContain("quorummind_create_blueprint");
     expect(body.run.summary.nextActions).toHaveLength(3);
     expect(body.run.result.finalSpec.title).toContain("视觉小说");
+  });
+
+  it("returns a human-review package instead of failing when the autonomous round budget is exhausted", async () => {
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/agent-runs/blueprint", {
+        method: "POST",
+        body: JSON.stringify({
+          question: "我想做一个视觉类游戏，用多 agent 处理小说文本，工作流和字段怎么设计？",
+          mode: "deep",
+          locale: "zh",
+          context,
+          agentRuntime: {
+            threadId: "api-agent-thread-needs-review",
+            maxConsensusRounds: 2
+          }
+        })
+      }),
+      { QUORUMMIND_PROVIDER_MODE: "demo" }
+    );
+
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.run.summary).toMatchObject({
+      consensusPassed: false,
+      humanReviewRequired: true,
+      terminationReason: "round_budget_exhausted"
+    });
+    expect(body.run.trace.find((entry: { node: string }) => entry.node === "human_review_gate")).toMatchObject({
+      status: "needs_review"
+    });
+  });
+
+  it("rejects invalid PDF export payloads before rendering", async () => {
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/exports/pdf", {
+        method: "POST",
+        body: JSON.stringify({
+          html: "",
+          filename: "../bad.pdf"
+        })
+      }),
+      { QUORUMMIND_PROVIDER_MODE: "demo" }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(body.error).toContain("Invalid PDF export request");
   });
 
   it("runs a keyless mock live decision trace for deterministic E2E demos", async () => {

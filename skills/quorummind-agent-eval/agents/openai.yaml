@@ -1,0 +1,4 @@
+interface:
+  display_name: "QuorumMind AgentEval"
+  short_description: "Evaluate final quality, trajectories, schema health, latency, and cost."
+  default_prompt: "Use $quorummind-agent-eval to design or run an AgentEval audit with offline cases and online trace metrics."

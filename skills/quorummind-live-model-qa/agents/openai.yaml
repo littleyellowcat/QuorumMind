@@ -1,0 +1,4 @@
+interface:
+  display_name: "QuorumMind Live Model QA"
+  short_description: "Verify live provider calls, schema validity, fallback status, relevance, and language."
+  default_prompt: "Use $quorummind-live-model-qa to diagnose live-model output quality and source transparency."

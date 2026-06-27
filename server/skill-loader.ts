@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 
@@ -44,8 +44,9 @@ function parseSkillFrontmatter(content: string): SkillMeta | null {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
 
+  const runtimeMatch = content.match(/<!--\s*quorummind-skill\s*([\s\S]*?)-->/i);
   const raw: Record<string, unknown> = {};
-  for (const line of match[1].split("\n")) {
+  for (const line of [...match[1].split("\n"), ...(runtimeMatch?.[1].split("\n") ?? [])]) {
     const colonIdx = line.indexOf(":");
     if (colonIdx < 0) continue;
     const key = line.slice(0, colonIdx).trim();
@@ -67,14 +68,15 @@ function parseSkillFrontmatter(content: string): SkillMeta | null {
 
 function extractSkillBody(content: string): string {
   const parts = content.split("---\n");
-  return parts.length >= 3 ? parts.slice(2).join("---\n").trim() : content;
+  const body = parts.length >= 3 ? parts.slice(2).join("---\n") : content;
+  return body.replace(/<!--\s*quorummind-skill[\s\S]*?-->\s*/i, "").trim();
 }
 
 // ---------------------------------------------------------------------------
 // Caches
 // ---------------------------------------------------------------------------
 
-let skillIndexCache: SkillMeta[] | null = null;
+const skillIndexCache = new Map<string, SkillMeta[]>();
 const bodyCache = new Map<string, { body: string; ts: number }>();
 const matchCache = new Map<string, { result: SkillMeta[]; ts: number }>();
 
@@ -92,25 +94,56 @@ const matchCache = new Map<string, { result: SkillMeta[]; ts: number }>();
 export function loadAllSkills(dir?: string): SkillMeta[] {
   if (!isNode) return [];
 
-  const skillsDir =
-    dir ??
-    join(
-      process.env.QUORUMMIND_DATA_DIR ??
-        join(process.env.HOME ?? "~", ".quorummind"),
-      "skills",
-    );
+  const defaultUserSkillsDir = join(
+    process.env.QUORUMMIND_DATA_DIR ??
+      join(process.env.HOME ?? "~", ".quorummind"),
+    "skills",
+  );
+  const defaultProjectSkillsDir = join(process.cwd(), "skills");
+  const cacheKey = dir ?? `${defaultProjectSkillsDir}::${defaultUserSkillsDir}`;
 
-  if (skillIndexCache) return skillIndexCache;
+  const cached = skillIndexCache.get(cacheKey);
+  if (cached) return cached;
+
+  const loaded = dir
+    ? loadSkillsFromDirectory(dir)
+    : [
+        ...loadSkillsFromDirectory(defaultProjectSkillsDir, { projectOnly: true }),
+        ...loadSkillsFromDirectory(defaultUserSkillsDir),
+      ];
+
+  const byName = new Map<string, SkillMeta>();
+  for (const skill of loaded) byName.set(skill.name, skill);
+
+  const result = [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+  skillIndexCache.set(cacheKey, result);
+  return result;
+}
+
+function loadSkillsFromDirectory(
+  skillsDir: string,
+  options: { projectOnly?: boolean } = {},
+): SkillMeta[] {
   if (!existsSync(skillsDir)) return [];
 
-  const files = readdirSync(skillsDir).filter((f) => f.endsWith(".md"));
-  skillIndexCache = files.flatMap((file) => {
-    const content = readFileSync(join(skillsDir, file), "utf8");
-    const meta = parseSkillFrontmatter(content);
-    return meta ? [{ ...meta, path: join(skillsDir, file) }] : [];
-  });
+  return readdirSync(skillsDir)
+    .flatMap((entry) => {
+      const path = join(skillsDir, entry);
+      const isProjectSkill = entry.startsWith("quorummind-");
+      if (options.projectOnly && !isProjectSkill) return [];
 
-  return skillIndexCache;
+      const stat = statSync(path);
+      if (stat.isFile() && entry.endsWith(".md")) return [path];
+      if (stat.isDirectory()) {
+        const skillPath = join(path, "SKILL.md");
+        return existsSync(skillPath) ? [skillPath] : [];
+      }
+      return [];
+    })
+    .flatMap((path) => {
+      const meta = parseSkillFrontmatter(readFileSync(path, "utf8"));
+      return meta ? [{ ...meta, path }] : [];
+    });
 }
 
 /**
@@ -144,7 +177,7 @@ export function loadSkillBody(path: string): string {
  * Clear all cached skill indices and bodies.
  */
 export function clearSkillCache(): void {
-  skillIndexCache = null;
+  skillIndexCache.clear();
   bodyCache.clear();
   matchCache.clear();
 }
@@ -160,7 +193,7 @@ export function clearSkillCache(): void {
  * 1. Role must match (or skill has `roles: ["all"]`).
  * 2. Domain must match (or skill has `domain: "all"`).
  * 3. If the skill declares triggers, at least one trigger must appear as a
- *    token in the lowercased question.
+ *    substring or whitespace token in the lowercased question.
  * 4. Skills with no triggers always pass the trigger filter.
  *
  * Results are cached with a 5-minute TTL.
@@ -181,6 +214,7 @@ export function matchSkills(
     .toLowerCase()
     .split(/\s+/)
     .filter((t) => t.length > 1);
+  const questionLower = question.toLowerCase();
 
   const matched = all
     .filter(
@@ -190,7 +224,10 @@ export function matchSkills(
     .filter(
       (s) =>
         s.triggers.length === 0 ||
-        s.triggers.some((t) => tokens.includes(t.toLowerCase())),
+        s.triggers.some((t) => {
+          const trigger = t.toLowerCase();
+          return questionLower.includes(trigger) || tokens.includes(trigger);
+        }),
     )
     .slice(0, 6);
 

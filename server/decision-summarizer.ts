@@ -1,7 +1,7 @@
 import type { DecisionRoomResult } from "../src/lib/workflow";
-import { writeDecisionSummary } from "../src/lib/knowledge-store";
-import { resolveDataDir } from "../src/lib/knowledge-index";
-import { rebuildIndex } from "../src/lib/knowledge-index";
+import { writeDecisionSummary } from "./knowledge-store";
+import { resolveDataDir } from "./knowledge-index";
+import { rebuildIndex } from "./knowledge-index";
 import { inferDecisionDomain } from "../src/lib/model-reputation";
 
 export type DecisionSummary = {

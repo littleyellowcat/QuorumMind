@@ -11,13 +11,13 @@ import type {
   Proposal,
   Verdict
 } from "./domain";
-import { buildKnowledgeInjection } from "./knowledge-inject";
 import { calculateMonteCarloStressLens, calculateRegretMap, calculateTopsisLens, scoreProposals } from "./scoring";
 
 type RunDecisionRoomInput = {
   question: string;
   mode: DecisionMode;
   context: DecisionContext;
+  knowledgeInjection?: string;
 };
 
 export type DecisionRoomResult = {
@@ -31,7 +31,7 @@ export type DecisionRoomResult = {
   revisedProposals: Proposal[];
   rankings: AgentRanking[];
   verdict: Verdict;
-  knowledgeInjection: string;
+  knowledgeInjection?: string;
 };
 
 const defaultWeights = {
@@ -50,7 +50,7 @@ const defaultWeights = {
 export function runDecisionRoom(input: RunDecisionRoomInput): DecisionRoomResult {
   const roomId = "demo-room";
   const decisionPattern = inferDecisionPattern(input.question, input.context);
-  const knowledgeInjection = buildKnowledgeInjection(input.question, input.context);
+  const knowledgeInjection = input.knowledgeInjection ?? "";
   const agents = createDefaultAgents();
   const activeAgents = input.mode === "fast" ? agents.slice(0, 3) : agents;
   const initialProposals = activeAgents.map((agent) => generateProposal(roomId, agent, input.context, input.question, knowledgeInjection));

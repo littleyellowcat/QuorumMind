@@ -1,6 +1,4 @@
 import type { Agent, Critique, DecisionContext, Proposal } from "./domain";
-import { matchSkills } from "./skill-loader";
-import { buildSkillCandidateList, buildSkillInjection } from "./skill-inject";
 
 const baseRisks = {
   tenantLeak: {
@@ -106,15 +104,7 @@ export function createDefaultAgents(): Agent[] {
 }
 
 export function generateProposal(roomId: string, agent: Agent, context: DecisionContext, question = "", knowledgeInjection = ""): Proposal {
-  // ── Skill integration ───────────────────────────────────────────
-  const skillMatches = matchSkills(question ?? "", domainFromContext(context), agent.role);
-  const skillCandidateList = buildSkillCandidateList(skillMatches);
-  // For demo agent, auto-select the top 2 most matched skills
-  const autoChosen = skillMatches.slice(0, 2).map(s => s.name);
-  const skillBody = buildSkillInjection(autoChosen, skillMatches);
-
-  const enhancedKnowledge = [knowledgeInjection, skillBody].filter(Boolean).join("\n\n---\n\n");
-  const prefix = enhancedKnowledge ? `${enhancedKnowledge}\n\n---\n\n` : "";
+  const prefix = knowledgeInjection ? `${knowledgeInjection}\n\n---\n\n` : "";
 
   if (isAgentFrameworkQuestion(question, context)) {
     return injectKnowledge(generateAgentFrameworkProposal(roomId, agent, context), prefix);
@@ -844,26 +834,6 @@ export function reviseProposal(proposal: Proposal, critiques: Critique[]): Propo
     migrationPath: [...proposal.migrationPath, ...acceptedSuggestions],
     confidence: Math.min(0.95, proposal.confidence + 0.03)
   };
-}
-
-function domainFromContext(context: DecisionContext): string {
-  // Derive a domain string from the decision context to match against skill frontmatter
-  const text = [
-    context.teamProfile,
-    ...context.candidateOptions,
-    ...context.existingConstraints,
-  ]
-    .join(" ")
-    .toLowerCase();
-
-  if (/tenant|postgres|database|schema|rls/.test(text)) return "technical_architecture";
-  if (/security|auth|encryption|vulnerability|threat/.test(text)) return "security";
-  if (/cost|budget|pricing|cloud|aws|gcp|azure|spend/.test(text)) return "cost";
-  if (/microservice|decomposition|monolith|module|extract/.test(text)) return "architecture";
-  if (/network|load|traffic|cache|deploy|kubernetes|k8s/.test(text)) return "infrastructure";
-  if (/backend|frontend|api|graphql|rest/.test(text)) return "development";
-
-  return "all";
 }
 
 function isServiceDecompositionQuestion(question: string, context: DecisionContext): boolean {

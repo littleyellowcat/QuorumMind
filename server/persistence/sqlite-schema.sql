@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS decision_traces (
   room_id TEXT PRIMARY KEY REFERENCES decision_rooms(id) ON DELETE CASCADE,
   result_json TEXT NOT NULL,
   provider_trace_json TEXT NOT NULL,
+  context_ledger_json TEXT,
   live_verdict_json TEXT,
   prompt_bundle_json TEXT NOT NULL,
   adr_markdown TEXT NOT NULL,

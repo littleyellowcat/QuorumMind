@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import type { AutonomousConsensusIteration, AutonomousAgentTraceEntry, AutonomousToolCall } from "./agent-platform/autonomous-blueprint";
 import type { LiveDecisionTraceEntry } from "./live-decision";
+import type { RunEventInput } from "./harness/run-event-trace";
 
 // ── Constants ──────────────────────────────────────────────────
 
@@ -133,7 +134,11 @@ function extractStateMessages(state: {
   }
 
   for (const entry of state.providerTrace ?? []) {
-    if (entry.text) messages.push(entry.text);
+    if (entry.outputRef?.preview) {
+      messages.push(entry.outputRef.preview);
+    } else if (entry.text) {
+      messages.push(entry.text);
+    }
   }
 
   return messages;
@@ -380,4 +385,28 @@ export function persistContextSummary(
   } catch {
     // Best-effort persistence; table may not exist.
   }
+}
+
+export type ContextCompactionEventInput = {
+  roundNumber: number;
+  fillRatio: number;
+  tokenCountBefore: number;
+  tokenCountAfter: number;
+};
+
+export function buildContextCompactionEvents(input: ContextCompactionEventInput): RunEventInput[] {
+  const percentage = Math.round(input.fillRatio * 100);
+
+  return [
+    {
+      type: "context_compaction_start",
+      severity: "info",
+      summary: `Context compaction started at round ${input.roundNumber}; estimated fill ratio ${percentage}%.`
+    },
+    {
+      type: "context_compaction_complete",
+      severity: "info",
+      summary: `Context compaction completed at round ${input.roundNumber}; tokens ${input.tokenCountBefore} -> ${input.tokenCountAfter}.`
+    }
+  ];
 }

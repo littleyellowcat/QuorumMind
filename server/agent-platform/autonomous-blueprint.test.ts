@@ -75,6 +75,10 @@ describe("runAutonomousBlueprintGraph", () => {
       "quorummind_validate_blueprint",
       "quorummind_select_next_actions"
     ]);
+    expect(run.toolCalls.find((entry) => entry.toolName === "quorummind_create_blueprint")?.outputRef).toMatchObject({
+      label: "draft_blueprint:final_spec_markdown",
+      sha256: expect.stringMatching(/^[a-f0-9]{64}$/)
+    });
     expect(run.consensusLoop.map((iteration) => iteration.consensusScore)).toEqual(
       [...run.consensusLoop.map((iteration) => iteration.consensusScore)].sort((a, b) => a - b)
     );
@@ -90,6 +94,7 @@ describe("runAutonomousBlueprintGraph", () => {
     });
     expect(run.clarification.strategy).toBe("answer_with_assumptions");
     expect(run.reactToolSteps.map((step) => step.toolName)).toContain("quorummind_validate_blueprint");
+    expect(run.trace.find((entry) => entry.node === "react_toolbox")?.evidence.join(" ")).toContain("ToolRegistry materialized");
     expect(run.taskTree.map((task) => task.ownerAgent)).toContain("planner_agent");
     expect(run.toolPermissions.every((permission) => permission.decision === "auto" || permission.decision === "requires_human" || permission.decision === "blocked")).toBe(true);
     expect(run.toolPermissions.map((permission) => permission.category)).toEqual(

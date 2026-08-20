@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { runDecisionRoom } from "./workflow";
 import { runBlueprintRoom } from "./blueprint";
 import type { DecisionContext } from "./domain";
+import type { ContextSourceLedger } from "./api-client";
 import {
   createAdrMarkdownExport,
   createBlueprintBacklogExport,
@@ -22,6 +23,29 @@ const context: DecisionContext = {
   existingConstraints: ["Use PostgreSQL"],
   candidateOptions: ["Shared tables", "Schema per tenant"],
   assumptions: ["No strict compliance need at launch"]
+};
+
+const contextLedger: ContextSourceLedger = {
+  schemaVersion: 1,
+  contextHash: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+  sourceCounts: {
+    user_input: 1,
+    structured_context: 1,
+    knowledge_injection: 0,
+    reputation_feedback: 0,
+    provider_trace: 0,
+    deterministic_fallback: 1
+  },
+  providerEvidence: {
+    attempted: false,
+    usableCalls: 0,
+    failedCalls: 0
+  },
+  fallback: {
+    used: true,
+    reason: "provider_mode_demo"
+  },
+  sources: []
 };
 
 describe("exporters", () => {
@@ -63,7 +87,8 @@ describe("exporters", () => {
       ],
       liveVerdict: null,
       promptBundle: { version: "manual-v1", agents: [], prompts: [] },
-      result
+      result,
+      contextLedger
     });
 
     const parsed = JSON.parse(exported.contents) as Record<string, unknown>;
@@ -71,6 +96,13 @@ describe("exporters", () => {
     expect(exported.filename).toMatch(/quorummind-trace-/);
     expect(exported.mimeType).toBe("application/json;charset=utf-8");
     expect(parsed.question).toBe("Should we use shared tables?");
+    expect(parsed.contextLedger).toMatchObject({
+      contextHash: contextLedger.contextHash,
+      fallback: {
+        used: true,
+        reason: "provider_mode_demo"
+      }
+    });
     expect(JSON.stringify(parsed)).toContain("gpt-4o-mini");
   });
 
@@ -117,7 +149,8 @@ describe("exporters", () => {
         usedProposalPhase: "revision"
       },
       promptBundle: { version: "manual-v1", agents: [], prompts: [] },
-      result
+      result,
+      contextLedger
     });
 
     expect(report).toContain("<title>QuorumMind Decision Report</title>");
@@ -144,6 +177,9 @@ describe("exporters", () => {
     expect(report).toContain("Regret map");
     expect(report).toContain("Worst-case regret");
     expect(report).toContain("Architecture Decision Record");
+    expect(report).toContain("Source transparency");
+    expect(report).toContain("Context hash");
+    expect(report).toContain("Provider policy");
   });
 
   it("creates a simplified final decision PDF HTML without audit-heavy sections", () => {

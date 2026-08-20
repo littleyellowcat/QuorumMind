@@ -14,6 +14,8 @@
 import { readdirSync, renameSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
+import { cleanupRunStorage } from "./harness/run-retention";
 
 const DATA_DIR = process.env.QUORUMMIND_DATA_DIR ?? join(process.env.HOME ?? "~", ".quorummind");
 const DECISIONS_DIR = join(DATA_DIR, "decisions");
@@ -21,11 +23,20 @@ const ARCHIVE_DIR = join(DECISIONS_DIR, "archive");
 const DECISION_MAX_AGE_DAYS = 90;
 const DECISION_DELETE_DAYS = 180;
 const CHECKPOINT_TTL_DAYS = 7;
+const RUN_MAX_AGE_DAYS = 30;
+const RUN_KEEP_LAST = 100;
 const MAX_PRESSURE_ROWS = 1000;
 const FEEDBACK_DECAY_DAYS = 60;
 const FEEDBACK_DELETE_DAYS = 120;
 
 const results: string[] = [];
+
+export type GarbageCollectorOptions = {
+  now?: string;
+  runStoreDir?: string;
+  runMaxAgeDays?: number;
+  runKeepLast?: number;
+};
 
 function now(): number { return Date.now(); }
 function daysAgo(days: number): number { return now() - days * 86400000; }
@@ -119,15 +130,36 @@ function decayFeedback(): void {
   db.close();
 }
 
+// ── 5. Harness run storage cleanup ───────────────────────
+
+function cleanHarnessRunStorage(options: GarbageCollectorOptions): void {
+  const removed = cleanupRunStorage({
+    rootDir: options.runStoreDir ?? process.env.QUORUMMIND_RUN_STORE_DIR,
+    now: options.now,
+    maxAgeDays: options.runMaxAgeDays ?? RUN_MAX_AGE_DAYS,
+    keepLast: options.runKeepLast ?? RUN_KEEP_LAST
+  });
+
+  if (removed.length > 0) {
+    results.push(`cleaned ${removed.length} harness runs`);
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────
 
-cleanDecisions();
-cleanCheckpoints();
-rotatePressureLogs();
-decayFeedback();
+export function runGarbageCollector(options: GarbageCollectorOptions = {}): string {
+  results.length = 0;
+  cleanDecisions();
+  cleanCheckpoints();
+  rotatePressureLogs();
+  decayFeedback();
+  cleanHarnessRunStorage(options);
 
-const report = results.length > 0
-  ? `[gc] ${results.join(", ")}`
-  : "[gc] nothing to clean — system is healthy";
+  return results.length > 0
+    ? `[gc] ${results.join(", ")}`
+    : "[gc] nothing to clean — system is healthy";
+}
 
-console.log(report);
+if (fileURLToPath(import.meta.url) === process.argv[1]) {
+  console.log(runGarbageCollector());
+}

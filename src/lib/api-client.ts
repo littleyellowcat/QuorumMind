@@ -7,6 +7,67 @@ import type { runDecisionRoom } from "./workflow";
 export type DecisionRoomResult = ReturnType<typeof runDecisionRoom>;
 export type DecisionTracePhase = "proposal" | "critique" | "revision" | "ranking" | "verdict";
 
+export type HarnessFailure = {
+  category:
+    | "timeout"
+    | "rate_limit"
+    | "provider_error"
+    | "safety_rejected"
+    | "json_parse_error"
+    | "schema_validation_error"
+    | "missing_reference"
+    | "qa_failed"
+    | "permission_denied"
+    | "unknown";
+  retryability: "retryable" | "repairable" | "human_action_required" | "terminal";
+  severity: "info" | "warning" | "error";
+  message: string;
+  providerStatus?: number;
+};
+
+export type BoundedOutputRef = {
+  label: string;
+  mime: "text/plain" | "application/json";
+  preview: string;
+  inline?: string;
+  path?: string;
+  redacted?: boolean;
+  truncated: boolean;
+  originalChars: number;
+  omittedChars: number;
+  sha256: string;
+};
+
+export type HarnessRunEvent = {
+  schemaVersion?: 1;
+  runId: string;
+  seq: number;
+  timestamp: string;
+  type:
+    | "run_start"
+    | "route_intent_start"
+    | "planner_complete"
+    | "critic_warn"
+    | "human_review_pause"
+    | "provider_attempt_start"
+    | "provider_attempt_success"
+    | "provider_attempt_retry"
+    | "provider_attempt_failure"
+    | "context_compaction_start"
+    | "context_compaction_complete"
+    | "run_complete";
+  severity: "info" | "warning" | "error";
+  phase?: DecisionTracePhase | string;
+  provider?: string;
+  model?: string;
+  attempt?: number;
+  maxAttempts?: number;
+  durationMs?: number;
+  summary: string;
+  truncated: boolean;
+  failure?: HarnessFailure;
+};
+
 export type LiveDecisionVerdict = {
   source: "live";
   selectedProposalId: string;
@@ -53,6 +114,82 @@ export type BlueprintExecutionSummary = {
     | "live_trace_error";
 };
 
+export type ProviderTraceEntry = {
+  id: string;
+  provider: "model_gateway" | "openai" | "deepseek" | "gemini";
+  model: string;
+  phase: DecisionTracePhase;
+  agentName?: string;
+  agentRole?: string;
+  agentWeight?: number;
+  modelReputation?: ModelReputation;
+  status: "ok" | "error";
+  text: string;
+  durationMs: number;
+  jsonParsed: boolean;
+  runId?: string;
+  attempt?: number;
+  maxAttempts?: number;
+  retryCount?: number;
+  attempts?: Array<{
+    attempt: number;
+    status: "ok" | "error";
+    durationMs: number;
+    jsonParsed: boolean;
+    validationStatus: "valid" | "repaired" | "invalid" | "unparsed";
+    failureClass?: "provider_error" | "json_parse_error" | "schema_validation_error";
+    failure?: HarnessFailure;
+    outputRef?: BoundedOutputRef;
+    error?: string;
+  }>;
+  validationStatus?: "valid" | "repaired" | "invalid" | "unparsed";
+  validationIssues?: Array<{
+    path: string;
+    severity: "warning" | "error";
+    message: string;
+  }>;
+  failureClass?: "provider_error" | "json_parse_error" | "schema_validation_error";
+  failure?: HarnessFailure;
+  normalized?: unknown;
+  parsed?: unknown;
+  outputRef?: BoundedOutputRef;
+  events?: HarnessRunEvent[];
+  error?: string;
+};
+
+export type ContextSourceType =
+  | "user_input"
+  | "structured_context"
+  | "knowledge_injection"
+  | "reputation_feedback"
+  | "provider_trace"
+  | "deterministic_fallback";
+
+export type ContextSourceLedgerEntry = {
+  id: string;
+  sourceType: ContextSourceType;
+  label: string;
+  summary: string;
+  hash: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type ContextSourceLedger = {
+  schemaVersion: 1;
+  contextHash: string;
+  sources: ContextSourceLedgerEntry[];
+  sourceCounts: Record<ContextSourceType, number>;
+  providerEvidence: {
+    attempted: boolean;
+    usableCalls: number;
+    failedCalls: number;
+  };
+  fallback: {
+    used: boolean;
+    reason: string;
+  };
+};
+
 export type DecisionApiResponse = {
   providerMode: "demo" | "live";
   persistence?: {
@@ -73,45 +210,28 @@ export type DecisionApiResponse = {
       modelEnvKey: string;
       model: string;
       notes: string;
+      policy?: {
+        effect: "allow" | "deny";
+        matchedAction?: string;
+        matchedResource?: string;
+        reason: string;
+      };
     }
   >;
-  providerTrace: Array<{
-    id: string;
-    provider: "model_gateway" | "openai" | "deepseek" | "gemini";
-    model: string;
-    phase: DecisionTracePhase;
-    agentName?: string;
-    agentRole?: string;
-    agentWeight?: number;
-    modelReputation?: ModelReputation;
-    status: "ok" | "error";
-    text: string;
-    durationMs: number;
-    jsonParsed: boolean;
-    runId?: string;
-    attempt?: number;
-    maxAttempts?: number;
-    retryCount?: number;
-    attempts?: Array<{
-      attempt: number;
-      status: "ok" | "error";
-      durationMs: number;
-      jsonParsed: boolean;
-      validationStatus: "valid" | "repaired" | "invalid" | "unparsed";
-      failureClass?: "provider_error" | "json_parse_error" | "schema_validation_error";
-      error?: string;
-    }>;
-    validationStatus?: "valid" | "repaired" | "invalid" | "unparsed";
-    validationIssues?: Array<{
-      path: string;
-      severity: "warning" | "error";
-      message: string;
-    }>;
-    failureClass?: "provider_error" | "json_parse_error" | "schema_validation_error";
-    normalized?: unknown;
-    parsed?: unknown;
-    error?: string;
-  }>;
+  providerTrace: ProviderTraceEntry[];
+  providerRun?: {
+    runId: string;
+    trace: ProviderTraceEntry[];
+    events: HarnessRunEvent[];
+    summary: {
+      providerCount: number;
+      entryCount: number;
+      failureCount: number;
+      retryCount: number;
+      truncatedOutputCount: number;
+    };
+  } | null;
+  contextLedger?: ContextSourceLedger;
   liveVerdict: LiveDecisionVerdict | null;
   promptBundle: ManualProviderBundle;
   result: DecisionRoomResult;
@@ -122,12 +242,15 @@ export type BlueprintApiResponse = {
   persistence?: NonNullable<DecisionApiResponse["persistence"]>;
   providerStatus: DecisionApiResponse["providerStatus"];
   providerTrace: DecisionApiResponse["providerTrace"];
+  providerRun?: DecisionApiResponse["providerRun"];
+  contextLedger?: ContextSourceLedger;
   blueprintExecution?: BlueprintExecutionSummary;
   promptBundle: ManualProviderBundle;
   result: BlueprintRoomResult;
 };
 
 export type AgentRuntimeConfig = {
+  runId?: string;
   threadId?: string;
   maxConsensusRounds?: number;
   humanReviewNote?: string;
@@ -211,6 +334,7 @@ export type AutonomousBlueprintRun = {
     inputSummary: string;
     outputSummary: string;
     source: "langchain_tool" | "live_model_provider";
+    outputRef?: BoundedOutputRef;
   }>;
   reactToolSteps: Array<{
     node: string;
@@ -235,6 +359,20 @@ export type AutonomousBlueprintRun = {
     category: "read_only" | "local_file_write" | "external_api_call" | "live_model_call" | "production_operation" | "paid_operation";
     risk: "low" | "medium" | "high";
     decision: "auto" | "requires_human" | "blocked";
+    reason: string;
+  }>;
+  permissionApprovals: Array<{
+    id: string;
+    runId: string;
+    toolName: string;
+    node: string;
+    category: "read_only" | "local_file_write" | "external_api_call" | "live_model_call" | "production_operation" | "paid_operation";
+    risk: "low" | "medium" | "high";
+    decision: "auto" | "requires_human" | "blocked";
+    status: "pending" | "approved" | "denied";
+    scope: "run" | "tool";
+    requestedBy: "planner_agent" | "executor_agent" | "critic_agent" | "memory_agent" | "supervisor_agent";
+    createdAt: string;
     reason: string;
   }>;
   executorActions: Array<{
@@ -328,6 +466,138 @@ export type AgentBlueprintApiResponse = {
   providerStatus: DecisionApiResponse["providerStatus"];
   run: AutonomousBlueprintRun;
 };
+
+export type AgentRunStatusRecord = {
+  runId: string;
+  kind: "live_decision" | "autonomous_blueprint";
+  status: "running" | "paused" | "completed" | "failed" | "interrupted";
+  threadId?: string;
+  createdAt: string;
+  updatedAt: string;
+  summary?: string;
+  resumeHint?: string;
+  checkpoint?: {
+    enabled: boolean;
+    saver: string;
+    threadId: string;
+  };
+  requestSnapshot?: Record<string, unknown>;
+  error?: string;
+};
+
+export type AgentRunStatusResponse = {
+  run: AgentRunStatusRecord;
+  events?: HarnessRunEvent[];
+  artifacts?: AgentRunArtifactRecord[];
+};
+
+export type AgentRunListResponse = {
+  runs: AgentRunStatusRecord[];
+};
+
+export type AgentRunEventListResponse = {
+  events: HarnessRunEvent[];
+  nextAfter: number;
+};
+
+export type AgentRunReadModelResponse = {
+  summary: {
+    runId: string;
+    kind?: AgentRunStatusRecord["kind"];
+    status?: AgentRunStatusRecord["status"];
+    createdAt?: string;
+    updatedAt?: string;
+    summary?: string;
+    eventCount: number;
+    artifactCount: number;
+    lastEventType?: HarnessRunEvent["type"];
+    lastEventAt?: string;
+  };
+  metrics: {
+    runId: string;
+    durationMs: number;
+    providerCallCount: number;
+    retryCount: number;
+    failureCount: number;
+    humanReviewCount: number;
+    estimatedInputTokens: number;
+    estimatedOutputTokens: number;
+    estimatedTotalTokens: number;
+    estimatedCostUsd: number;
+    retryCostUsd: number;
+    fallbackSavedCostUsd: number;
+    artifactCount: number;
+    truncatedOutputCount: number;
+    eventCount: number;
+  };
+  timeline: Array<{
+    seq: number;
+    timestamp: string;
+    type: HarnessRunEvent["type"];
+    severity: HarnessRunEvent["severity"];
+    summary: string;
+    phase?: string;
+    provider?: string;
+    model?: string;
+    durationMs?: number;
+  }>;
+};
+
+export type AgentRunArtifactRecord = {
+  kind:
+    | "prompt_bundle"
+    | "provider_trace"
+    | "bounded_output"
+    | "exported_pdf"
+    | "resume_snapshot"
+    | "run_status"
+    | "event_log";
+  label: string;
+  createdAt?: string;
+  path?: string;
+  inline?: unknown;
+  sha256?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type AgentRunTerminalResponse = {
+  runId: string;
+  status: "completed" | "paused" | "interrupted" | "not_found" | AgentRunStatusRecord["status"];
+  reason?: string;
+  updatedAt?: string;
+};
+
+export type AgentRunResumeResponse = {
+  status: "resumed" | "resume_recorded" | "not_resumable";
+  message?: string;
+  run: AgentRunStatusRecord | AutonomousBlueprintRun;
+};
+
+export type AgentRunApprovalReplyRequest = {
+  reply: "approve" | "reject" | "always";
+  message?: string;
+};
+
+export type AgentRunApprovalReplyResponse = {
+  approval: {
+    id: string;
+    runId: string;
+    toolName: string;
+    node: string;
+    category: string;
+    risk: string;
+    decision: string;
+    status: "pending" | "approved" | "denied";
+    scope: "run" | "tool";
+    requestedBy: string;
+    createdAt: string;
+    approvedAt?: string;
+    deniedAt?: string;
+    replyMessage?: string;
+    reason: string;
+  };
+};
+
 
 export type DecisionApiHealth = {
   status: "ok";
@@ -522,6 +792,165 @@ export async function requestAutonomousBlueprintRun(
   }
 
   return body as AgentBlueprintApiResponse;
+}
+
+export async function getAgentRunStatus(
+  runId: string,
+  fetchImpl: FetchLike = fetch
+): Promise<AgentRunStatusResponse> {
+  const response = await fetchImpl(`/api/agent-runs/${encodeURIComponent(runId)}`, {
+    method: "GET",
+    headers: apiHeaders()
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Agent run status failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as AgentRunStatusResponse;
+}
+
+export async function listAgentRuns(fetchImpl: FetchLike = fetch): Promise<AgentRunListResponse> {
+  const response = await fetchImpl("/api/agent-runs", {
+    method: "GET",
+    headers: apiHeaders()
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Agent run list failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as AgentRunListResponse;
+}
+
+export async function listAgentRunEvents(
+  runId: string,
+  options: { after?: number } = {},
+  fetchImpl: FetchLike = fetch
+): Promise<AgentRunEventListResponse> {
+  const params = new URLSearchParams();
+
+  if (typeof options.after === "number") {
+    params.set("after", String(options.after));
+  }
+
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const response = await fetchImpl(`/api/agent-runs/${encodeURIComponent(runId)}/events${suffix}`, {
+    method: "GET",
+    headers: apiHeaders()
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Agent run events failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as AgentRunEventListResponse;
+}
+
+export async function getAgentRunReadModel(
+  runId: string,
+  fetchImpl: FetchLike = fetch
+): Promise<AgentRunReadModelResponse> {
+  const response = await fetchImpl(`/api/agent-runs/${encodeURIComponent(runId)}/read-model`, {
+    method: "GET",
+    headers: apiHeaders()
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Agent run read model failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as AgentRunReadModelResponse;
+}
+
+export async function resumeAgentRun(
+  runId: string,
+  humanReviewNote: string,
+  fetchImpl: FetchLike = fetch
+): Promise<AgentRunResumeResponse> {
+  const response = await fetchImpl(`/api/agent-runs/${encodeURIComponent(runId)}/resume`, {
+    method: "POST",
+    headers: apiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ humanReviewNote })
+  });
+  const body = await readJson(response);
+
+  if (!response.ok && response.status !== 409) {
+    const message = typeof body?.error === "string" ? body.error : `Agent run resume failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as AgentRunResumeResponse;
+}
+
+export async function replyAgentRunApproval(
+  runId: string,
+  approvalId: string,
+  input: AgentRunApprovalReplyRequest,
+  fetchImpl: FetchLike = fetch
+): Promise<AgentRunApprovalReplyResponse> {
+  const response = await fetchImpl(
+    `/api/agent-runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(approvalId)}/reply`,
+    {
+      method: "POST",
+      headers: apiHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(input)
+    }
+  );
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Agent run approval reply failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as AgentRunApprovalReplyResponse;
+}
+
+export async function interruptAgentRun(
+  runId: string,
+  reason: string,
+  fetchImpl: FetchLike = fetch
+): Promise<AgentRunTerminalResponse> {
+  const response = await fetchImpl(`/api/agent-runs/${encodeURIComponent(runId)}/interrupt`, {
+    method: "POST",
+    headers: apiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ reason })
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Agent run interrupt failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as AgentRunTerminalResponse;
+}
+
+export async function waitAgentRun(
+  runId: string,
+  fetchImpl: FetchLike = fetch
+): Promise<AgentRunTerminalResponse> {
+  const response = await fetchImpl(`/api/agent-runs/${encodeURIComponent(runId)}/wait`, {
+    method: "GET",
+    headers: apiHeaders()
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Agent run wait failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as AgentRunTerminalResponse;
 }
 
 export async function downloadRenderedPdf(

@@ -22,6 +22,18 @@ import {
   type CompressedStateSlice,
   DEFAULT_MAX_TOKENS
 } from "../context-compressor";
+import { boundOutput, type BoundedOutputRef } from "../harness/bounded-output-store";
+import { createPermissionApprovalStore } from "../harness/permission-approval-store";
+import { defaultHarnessRootDir } from "../harness/run-event-store";
+import { executeGovernedTool } from "../harness/tool-execution-runner";
+import { createToolRegistry } from "../harness/tool-registry";
+import {
+  createPermissionApprovalRecord,
+  decideRoleToolPermission,
+  decideToolPermission,
+  type AgentCapabilityRole,
+  type ToolPermissionApprovalRecord
+} from "../harness/tool-governance";
 
 export type AutonomousAgentPlatformRuntime = {
   orchestrator: "langgraph";
@@ -46,6 +58,7 @@ export type AutonomousToolCall = {
   inputSummary: string;
   outputSummary: string;
   source: "langchain_tool" | "live_model_provider";
+  outputRef?: BoundedOutputRef;
 };
 
 export type AutonomousLiveModelSummary = {
@@ -137,6 +150,8 @@ export type AutonomousToolPermissionDecision = {
   decision: "auto" | "requires_human" | "blocked";
   reason: string;
 };
+
+export type AutonomousPermissionApprovalRecord = ToolPermissionApprovalRecord;
 
 export type AutonomousExecutorAction = {
   taskId: string;
@@ -276,6 +291,7 @@ export type AutonomousBlueprintRun = {
   reactToolSteps: AutonomousReactToolStep[];
   taskTree: AutonomousTaskNode[];
   toolPermissions: AutonomousToolPermissionDecision[];
+  permissionApprovals: AutonomousPermissionApprovalRecord[];
   executorActions: AutonomousExecutorAction[];
   criticReviews: AutonomousCriticReview[];
   memoryEvents: AutonomousMemoryEvent[];
@@ -293,6 +309,7 @@ export type AutonomousBlueprintRun = {
 };
 
 export type RunAutonomousBlueprintGraphInput = {
+  runId?: string;
   question: string;
   mode: DecisionMode;
   locale: "en" | "zh";
@@ -305,6 +322,7 @@ export type RunAutonomousBlueprintGraphInput = {
     unavailableReason?: AutonomousLiveModelSummary["fallbackReason"];
     runner?: () => Promise<LiveDecisionTraceEntry[]>;
   };
+  runStoreDir?: string;
 };
 
 type BlueprintToolOutput = {
@@ -524,11 +542,13 @@ const toolPermissionPolicyTool = tool(
     description: "Classify which tools can run automatically and which require human approval.",
     schema: z.object({
       locale: localeSchema,
+      runId: z.string().optional(),
       tasks: z.array(
         z.object({
           id: z.string(),
           title: z.string(),
           node: z.string(),
+          ownerAgent: z.enum(["planner_agent", "executor_agent", "critic_agent", "memory_agent", "supervisor_agent"]).optional(),
           toolName: z.string().optional(),
           objective: z.string()
         })
@@ -618,6 +638,39 @@ const supervisorAgentTool = tool(
   }
 );
 
+function createAutonomousToolRegistry() {
+  const registry = createToolRegistry();
+  const register = (
+    name: string,
+    description: string,
+    ownerAgent: AgentCapabilityRole,
+    schema: Record<string, unknown> = {}
+  ) =>
+    registry.register({
+      name,
+      description,
+      ownerAgent,
+      permissionCategory: name.includes("memory") ? "local_file_write" : name.includes("live") ? "live_model_call" : "read_only",
+      risk: name.includes("live") ? "medium" : "low",
+      schema
+    });
+
+  register(routeIntentTool.name, "Classify request intent and route the graph.", "planner_agent");
+  register(clarifyRequirementsTool.name, "Record clarification needs and assumptions.", "planner_agent");
+  register(reactToolboxTool.name, "Select bounded node-local ReAct tools.", "executor_agent");
+  register(plannerAgentTool.name, "Decompose goals into an autonomous task tree.", "planner_agent");
+  register(toolPermissionPolicyTool.name, "Classify tool permission decisions.", "supervisor_agent");
+  register(memoryAgentTool.name, "Write bounded run and thread memory.", "memory_agent");
+  register(executorAgentTool.name, "Execute permitted local tasks.", "executor_agent");
+  register(createBlueprintTool.name, "Generate deterministic blueprint draft.", "executor_agent");
+  register(validateBlueprintTool.name, "Validate blueprint consensus and gates.", "critic_agent");
+  register(advanceConsensusRoundTool.name, "Advance the bounded consensus loop.", "executor_agent");
+  register(selectNextActionsTool.name, "Select final actions and deliverables.", "executor_agent");
+  register("quorummind_live_blueprint_provider_trace", "Call live model providers for blueprint review.", "executor_agent");
+
+  return registry;
+}
+
 /** Internal sentinel used by array reducers to signal state truncation during compression.
  *  When the first element of an update array is this sentinel, the reducer clears the
  *  accumulated array and replaces it with the remaining elements. */
@@ -630,6 +683,7 @@ const AutonomousBlueprintAnnotation = Annotation.Root({
   mode: Annotation<DecisionMode>(),
   locale: Annotation<"en" | "zh">(),
   context: Annotation<DecisionContext>(),
+  runStoreDir: Annotation<string | undefined>(),
   humanReviewNote: Annotation<string | undefined>(),
   currentConsensusRoundIndex: Annotation<number>(),
   maxConsensusRounds: Annotation<number>(),
@@ -688,6 +742,10 @@ const AutonomousBlueprintAnnotation = Annotation.Root({
       }
       return left.concat(right);
     },
+    default: () => []
+  }),
+  permissionApprovals: Annotation<AutonomousPermissionApprovalRecord[]>({
+    reducer: (left, right) => left.concat(right),
     default: () => []
   }),
   executorActions: Annotation<AutonomousExecutorAction[]>({
@@ -790,12 +848,18 @@ export async function runAutonomousBlueprintGraph(input: RunAutonomousBlueprintG
   const threadId = normalizeThreadId(input.threadId);
   const maxConsensusRounds = clampPositiveInteger(input.maxConsensusRounds, 1, MAX_CONSENSUS_ROUNDS_LIMIT, MAX_CONSENSUS_ROUNDS_LIMIT);
   const liveModel = input.liveModel ?? { requested: false as const, unavailableReason: "deterministic_mode" as const };
-  const { liveModel: _liveModelInput, threadId: _threadIdInput, maxConsensusRounds: _maxRoundsInput, ...initialStateInput } = input;
+  const {
+    liveModel: _liveModelInput,
+    threadId: _threadIdInput,
+    maxConsensusRounds: _maxRoundsInput,
+    runId: _runIdInput,
+    ...initialStateInput
+  } = input;
   const autonomousBlueprintGraph = buildAutonomousBlueprintGraph({ liveModel });
   const finalState = await autonomousBlueprintGraph.invoke(
     {
       ...initialStateInput,
-      runId: createRunId(),
+      runId: input.runId ?? createRunId(),
       threadId,
       currentConsensusRoundIndex: 0,
       maxConsensusRounds,
@@ -804,6 +868,7 @@ export async function runAutonomousBlueprintGraph(input: RunAutonomousBlueprintG
       reactToolSteps: [],
       taskTree: [],
       toolPermissions: [],
+      permissionApprovals: [],
       executorActions: [],
       criticReviews: [],
       memoryEvents: [],
@@ -856,6 +921,7 @@ export async function runAutonomousBlueprintGraph(input: RunAutonomousBlueprintG
     reactToolSteps: finalState.reactToolSteps,
     taskTree: finalState.taskTree,
     toolPermissions: finalState.toolPermissions,
+    permissionApprovals: finalState.permissionApprovals,
     executorActions: finalState.executorActions,
     criticReviews: finalState.criticReviews,
     memoryEvents: finalState.memoryEvents,
@@ -1012,18 +1078,11 @@ async function reactToolboxNode(state: AutonomousBlueprintGraphState): Promise<A
   const goalBrief = state.goalBrief ?? buildGoalBrief(state);
   const intent = state.intent ?? buildIntentPlan(state.question, state.locale);
   const clarification = state.clarification ?? buildClarificationPlan(state.question, state.locale, intent);
-  const availableTools = [
-    plannerAgentTool.name,
-    toolPermissionPolicyTool.name,
-    memoryAgentTool.name,
-    executorAgentTool.name,
-    criticAgentTool.name,
-    supervisorAgentTool.name,
-    createBlueprintTool.name,
-    validateBlueprintTool.name,
-    advanceConsensusRoundTool.name,
-    selectNextActionsTool.name
-  ];
+  const availableTools = materializeAutonomousToolNames({
+    runId: state.runId,
+    locale: state.locale,
+    liveModelPreapproved: false
+  });
   const steps = await reactToolboxTool.invoke({
     locale: state.locale,
     intentCategory: intent.category,
@@ -1056,10 +1115,32 @@ async function reactToolboxNode(state: AutonomousBlueprintGraphState): Promise<A
           state.locale === "zh"
             ? "已在节点内部选择受控工具，不让模型自由无界调用外部工具。"
             : "Selected bounded node-local tools instead of unrestricted external tool use.",
-        evidence: steps.map((step) => `${step.toolName}: ${step.observation}`)
+        evidence: [
+          `ToolRegistry materialized ${availableTools.length} allowed tools for this run.`,
+          ...steps.map((step) => `${step.toolName}: ${step.observation}`)
+        ]
       }
     ]
   };
+}
+
+function materializeAutonomousToolNames(input: {
+  runId: string;
+  locale: "en" | "zh";
+  liveModelPreapproved: boolean;
+}): string[] {
+  const registry = createAutonomousToolRegistry();
+  const roles: AgentCapabilityRole[] = ["planner_agent", "executor_agent", "critic_agent", "memory_agent", "supervisor_agent"];
+  const names = roles.flatMap((role) =>
+    registry.materialize({
+      runId: input.runId,
+      role,
+      locale: input.locale,
+      liveModelPreapproved: input.liveModelPreapproved
+    }).map((tool) => tool.name)
+  );
+
+  return [...new Set(names)];
 }
 
 async function plannerAgentNode(state: AutonomousBlueprintGraphState): Promise<AutonomousBlueprintGraphUpdate> {
@@ -1075,18 +1156,30 @@ async function plannerAgentNode(state: AutonomousBlueprintGraphState): Promise<A
   });
   const permissions = await toolPermissionPolicyTool.invoke({
     locale: state.locale,
+    runId: state.runId,
     tasks: taskTree.map((task) => ({
       id: task.id,
       title: task.title,
       node: task.ownerAgent,
+      ownerAgent: task.ownerAgent,
       toolName: task.toolName,
       objective: task.objective
     }))
   });
+  const permissionApprovals = permissions
+    .filter((permission) => permission.decision === "requires_human")
+    .map((permission) =>
+      createPermissionApprovalRecord(permission, {
+        runId: state.runId,
+        requestedBy: roleForNode(permission.node),
+        scope: "run"
+      })
+    );
 
   return {
     taskTree,
     toolPermissions: permissions,
+    permissionApprovals,
     toolCalls: [
       {
         toolName: plannerAgentTool.name,
@@ -1341,7 +1434,13 @@ async function draftBlueprintNode(state: AutonomousBlueprintGraphState): Promise
         node: "draft_blueprint",
         inputSummary: `${state.mode} · ${state.locale} · ${state.question.slice(0, 80)}`,
         outputSummary: output.toolSummary,
-        source: "langchain_tool"
+        source: "langchain_tool",
+        outputRef: boundOutput(output.result.finalSpec.markdown, {
+          label: "draft_blueprint:final_spec_markdown",
+          storageDir: state.runStoreDir ?? defaultHarnessRootDir(),
+          runId: state.runId,
+          redactSecrets: true
+        })
       }
     ],
     trace: [
@@ -1390,12 +1489,31 @@ function liveModelReviewNode(liveModel: NonNullable<RunAutonomousBlueprintGraphI
         providerTrace: [],
         fallbackReason: liveModel.unavailableReason ?? "no_configured_providers"
       });
-      const permission = liveProviderPermissionDecision(state.locale, false);
+      const governed = await executeGovernedTool({
+        runId: state.runId,
+        role: "executor_agent",
+        toolName: "quorummind_live_blueprint_provider_trace",
+        node: "live_model_review",
+        objective: "live model blueprint trace without configured provider",
+        locale: state.locale,
+        approvalStore: createPermissionApprovalStore({ rootDir: state.runStoreDir ?? defaultHarnessRootDir() }),
+        execute: async () => []
+      });
+      const permission = governed.permission;
       const action = liveProviderExecutorAction(state.locale, permission, false);
+      const approval =
+        governed.status === "requires_human"
+          ? governed.approval
+          : createPermissionApprovalRecord(permission, {
+              runId: state.runId,
+              requestedBy: "supervisor_agent",
+              scope: "run"
+            });
 
       return {
         liveModel: summary,
         toolPermissions: [permission],
+        permissionApprovals: permission.decision === "requires_human" ? [approval] : [],
         executorActions: [action],
         trace: [
           {
@@ -1413,7 +1531,25 @@ function liveModelReviewNode(liveModel: NonNullable<RunAutonomousBlueprintGraphI
     }
 
     try {
-      const providerTrace = state.providerTrace.length > 0 ? state.providerTrace : await liveModel.runner();
+      const governed =
+        state.providerTrace.length > 0
+          ? undefined
+          : await executeGovernedTool({
+              runId: state.runId,
+              role: "executor_agent",
+              toolName: "quorummind_live_blueprint_provider_trace",
+              node: "live_model_review",
+              objective: "user preapproved live model blueprint trace",
+              locale: state.locale,
+              liveModelPreapproved: true,
+              approvalStore: createPermissionApprovalStore({ rootDir: state.runStoreDir ?? defaultHarnessRootDir() }),
+              execute: liveModel.runner
+            });
+      const providerTrace = state.providerTrace.length > 0
+        ? state.providerTrace
+        : governed?.status === "executed"
+          ? governed.output
+          : [];
       const summary = summarizeLiveModelTrace({
         requested: true,
         providerTrace,
@@ -1423,14 +1559,21 @@ function liveModelReviewNode(liveModel: NonNullable<RunAutonomousBlueprintGraphI
         ? enrichBlueprintWithModelContributions(result, providerTrace, state.locale)
         : result;
       const phaseSummary = summarizeTracePhases(providerTrace);
-      const permission = liveProviderPermissionDecision(state.locale, true);
+      const permission = governed?.permission ?? liveProviderPermissionDecision(state.locale, true);
       const action = liveProviderExecutorAction(state.locale, permission, true, providerTrace.length);
+      const approval = createPermissionApprovalRecord(permission, {
+        runId: state.runId,
+        requestedBy: "supervisor_agent",
+        scope: "run",
+        status: permission.decision === "auto" ? "approved" : "pending"
+      });
 
       return {
         result: enrichedResult,
         providerTrace: state.providerTrace.length > 0 ? [] : providerTrace,
         liveModel: summary,
         toolPermissions: [permission],
+        permissionApprovals: [approval],
         executorActions: [action],
         toolCalls: [
           {
@@ -1438,7 +1581,14 @@ function liveModelReviewNode(liveModel: NonNullable<RunAutonomousBlueprintGraphI
             node: "live_model_review",
             inputSummary: `${state.mode === "fast" ? "deep" : state.mode} · ${state.locale} · ${state.question.slice(0, 80)}`,
             outputSummary: `${providerTrace.length} provider calls · ${summary.usableCalls} usable · ${phaseSummary}`,
-            source: "live_model_provider"
+            source: "live_model_provider",
+            outputRef: boundOutput(providerTrace, {
+              label: "live_model_review:provider_trace",
+              maxInlineChars: 4_000,
+              storageDir: state.runStoreDir ?? defaultHarnessRootDir(),
+              runId: state.runId,
+              redactSecrets: true
+            })
           }
         ],
         trace: [
@@ -1467,10 +1617,17 @@ function liveModelReviewNode(liveModel: NonNullable<RunAutonomousBlueprintGraphI
       });
       const permission = liveProviderPermissionDecision(state.locale, true);
       const action = liveProviderExecutorAction(state.locale, permission, false);
+      const approval = createPermissionApprovalRecord(permission, {
+        runId: state.runId,
+        requestedBy: "supervisor_agent",
+        scope: "run",
+        status: permission.decision === "auto" ? "approved" : "pending"
+      });
 
       return {
         liveModel: summary,
         toolPermissions: [permission],
+        permissionApprovals: [approval],
         executorActions: [action],
         trace: [
           {
@@ -2061,102 +2218,40 @@ function buildAutonomousTaskTree(input: {
 
 function evaluateToolPermissions(input: {
   locale: "en" | "zh";
-  tasks: Array<{ id: string; title: string; node: string; toolName?: string; objective: string }>;
+  runId?: string;
+  tasks: Array<{
+    id: string;
+    title: string;
+    node: string;
+    ownerAgent?: AgentCapabilityRole;
+    toolName?: string;
+    objective: string;
+  }>;
 }): AutonomousToolPermissionDecision[] {
-  const zh = input.locale === "zh";
-  return input.tasks.map((task) => {
-    const toolName = task.toolName ?? "unknown_tool";
-    const text = `${toolName} ${task.title} ${task.objective}`.toLowerCase();
-    const category = classifyToolPermissionCategory(text, toolName);
-    const userFacingLocalWrite = category === "local_file_write" && !toolName.includes("memory_agent");
-
-    if (category === "production_operation" || category === "paid_operation") {
-      return {
-        toolName,
-        node: task.node,
-        category,
-        risk: "high",
-        decision: "blocked",
-        reason:
-          category === "paid_operation"
-            ? zh
-              ? "该动作可能产生付费或扣费影响，默认禁止自动执行。"
-              : "This action may create paid usage or charges, so it is blocked by default."
-            : zh
-              ? "该动作可能改变生产系统或产生不可逆影响，默认禁止自动执行。"
-              : "This action may change production systems or cause irreversible effects, so it is blocked by default."
-      };
-    }
-
-    if (category === "live_model_call" || category === "external_api_call" || userFacingLocalWrite) {
-      return {
-        toolName,
-        node: task.node,
-        category,
-        risk: "medium",
-        decision: "requires_human",
-        reason:
-          category === "live_model_call"
-            ? zh
-              ? "该动作会调用真实模型 provider，可能产生延迟和成本，执行前需要人工确认。"
-              : "This action calls live model providers and may create latency or cost, so it requires human approval."
-            : category === "external_api_call"
-              ? zh
-                ? "该动作会调用外部 API 或发送外部消息，执行前需要人工确认。"
-                : "This action calls an external API or sends an external message, so it requires human approval."
-              : zh
-                ? "该动作会写入本地文件或导出结果，执行前需要人工确认。"
-                : "This action writes local files or exports results, so it requires human approval."
-      };
-    }
-
-    return {
-      toolName,
+  return input.tasks.map((task) =>
+    decideRoleToolPermission({
+      role: task.ownerAgent ?? roleForNode(task.node),
+      toolName: task.toolName ?? "unknown_tool",
       node: task.node,
-      category,
-      risk: "low",
-      decision: "auto",
-      reason:
-        category === "local_file_write"
-          ? zh
-            ? "该动作只写入受控的本地 checkpoint/记忆状态，可以自动执行。"
-            : "This action writes only bounded local checkpoint or memory state, so it can run automatically."
-          : zh
-            ? "该动作限制在只读或本地确定性工具内，可以自动执行。"
-            : "This action stays inside read-only or local deterministic tools, so it can run automatically."
-    };
-  });
+      objective: `${task.title} ${task.objective}`,
+      locale: input.locale,
+      liveModelPreapproved: false
+    })
+  );
 }
 
-function classifyToolPermissionCategory(
-  text: string,
-  toolName: string
-): AutonomousToolPermissionDecision["category"] {
-  if (matchesAny(text, ["charge", "payment", "paid", "billing", "扣费", "付费", "计费"])) {
-    return "paid_operation";
+function roleForNode(node: string): AgentCapabilityRole {
+  if (
+    node === "planner_agent" ||
+    node === "executor_agent" ||
+    node === "critic_agent" ||
+    node === "memory_agent" ||
+    node === "supervisor_agent"
+  ) {
+    return node;
   }
 
-  if (matchesAny(text, ["deploy", "delete", "production", "external_write", "生产发布", "生产", "删除", "不可逆"])) {
-    return "production_operation";
-  }
-
-  if (matchesAny(text, ["live", "provider", "llm", "model", "真实模型", "模型调用"])) {
-    return "live_model_call";
-  }
-
-  if (matchesAny(text, ["api", "webhook", "send_email", "email", "外部 api", "发邮件", "通知客户"])) {
-    return "external_api_call";
-  }
-
-  if (matchesAny(text, ["pdf", "export", "sqlite", "durable", "write", "checkpoint", "导出", "写入", "持久化"])) {
-    return "local_file_write";
-  }
-
-  if (toolName.includes("memory_agent")) {
-    return "local_file_write";
-  }
-
-  return "read_only";
+  return "executor_agent";
 }
 
 function executePermittedTasks(input: {
@@ -2203,22 +2298,13 @@ function executePermittedTasks(input: {
 }
 
 function liveProviderPermissionDecision(locale: "en" | "zh", userPreapproved: boolean): AutonomousToolPermissionDecision {
-  const zh = locale === "zh";
-
-  return {
+  return decideToolPermission({
     toolName: "quorummind_live_blueprint_provider_trace",
     node: "live_model_review",
-    category: "live_model_call",
-    risk: "medium",
-    decision: userPreapproved ? "auto" : "requires_human",
-    reason: userPreapproved
-      ? zh
-        ? "用户已选择真实模型深度蓝图，本次 provider 调用视为已授权；仍受阶段预算、超时和 schema 质量门约束。"
-        : "The user selected live deep Blueprint, so this provider call is pre-approved for this run; it remains bounded by phase budget, timeout, and schema gates."
-      : zh
-        ? "请求了真实模型深度蓝图，但当前没有可用 provider；需要先完成人工配置确认。"
-        : "Live deep Blueprint was requested but no provider is available; human configuration approval is required first."
-  };
+    objective: userPreapproved ? "user preapproved live model blueprint trace" : "live model blueprint trace without configured provider",
+    locale,
+    liveModelPreapproved: userPreapproved
+  });
 }
 
 function liveProviderExecutorAction(

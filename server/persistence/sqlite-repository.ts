@@ -22,6 +22,7 @@ export type PersistedDecisionRoomSummary = {
 
 export type PersistedDecisionRoomSnapshot = PersistedDecisionRoomSummary & {
   providerTrace: DecisionApiResponse["providerTrace"];
+  contextLedger?: DecisionApiResponse["contextLedger"];
   liveVerdict: DecisionApiResponse["liveVerdict"];
   promptBundle: ManualProviderBundle;
   result: DecisionRoomResult;
@@ -49,6 +50,7 @@ export function createSqliteDecisionRepository(options: { databasePath: string }
   const db = new DatabaseSync(options.databasePath);
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(readFileSync(new URL("./sqlite-schema.sql", import.meta.url), "utf8"));
+  ensureDecisionTraceColumns(db);
 
   return {
     saveDecisionRoom(input) {
@@ -89,15 +91,17 @@ export function createSqliteDecisionRepository(options: { databasePath: string }
             room_id,
             result_json,
             provider_trace_json,
+            context_ledger_json,
             live_verdict_json,
             prompt_bundle_json,
             adr_markdown,
             created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(
           input.id,
           JSON.stringify(input.result),
           JSON.stringify(input.providerTrace),
+          input.contextLedger ? JSON.stringify(input.contextLedger) : null,
           input.liveVerdict ? JSON.stringify(input.liveVerdict) : null,
           JSON.stringify(input.promptBundle),
           input.result.verdict.adrMarkdown,
@@ -151,6 +155,7 @@ export function createSqliteDecisionRepository(options: { databasePath: string }
             r.updated_at,
             t.result_json,
             t.provider_trace_json,
+            t.context_ledger_json,
             t.live_verdict_json,
             t.prompt_bundle_json,
             t.adr_markdown
@@ -167,6 +172,9 @@ export function createSqliteDecisionRepository(options: { databasePath: string }
       return {
         ...toDecisionRoomSummary(row),
         providerTrace: parseJson<DecisionApiResponse["providerTrace"]>(row.provider_trace_json, []),
+        contextLedger: row.context_ledger_json
+          ? parseJson<DecisionApiResponse["contextLedger"]>(row.context_ledger_json, undefined)
+          : undefined,
         liveVerdict: row.live_verdict_json
           ? parseJson<DecisionApiResponse["liveVerdict"]>(row.live_verdict_json, null)
           : null,
@@ -225,6 +233,19 @@ export function createSqliteDecisionRepository(options: { databasePath: string }
       db.close();
     }
   };
+}
+
+function ensureDecisionTraceColumns(db: DatabaseSync): void {
+  const columns = new Set(
+    db
+      .prepare("PRAGMA table_info(decision_traces)")
+      .all()
+      .map((row) => stringField((row as Record<string, unknown>).name))
+  );
+
+  if (!columns.has("context_ledger_json")) {
+    db.exec("ALTER TABLE decision_traces ADD COLUMN context_ledger_json TEXT");
+  }
 }
 
 function toDecisionRoomSummary(row: Record<string, unknown>): PersistedDecisionRoomSummary {

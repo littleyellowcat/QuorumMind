@@ -3,6 +3,7 @@ import { createGeminiProvider } from "./gemini";
 import { createModelGatewayProvider } from "./model-gateway";
 import { createMockProviderSet } from "./mock";
 import { createOpenAIProvider } from "./openai";
+import { evaluateProviderPolicy, isProviderPolicyAllowed, parseProviderPolicy, type ProviderPolicyDecision } from "./provider-policy";
 import type { ImplementedProviderId, ModelProvider, ProviderId } from "./types";
 
 export type Env = Record<string, string | undefined>;
@@ -28,6 +29,7 @@ export type ProviderStatus = {
   modelEnvKey: string;
   model: string;
   notes: string;
+  policy?: ProviderPolicyDecision;
 };
 
 export const providerRegistry: ProviderRegistryEntry[] = [
@@ -172,6 +174,8 @@ export const providerRegistry: ProviderRegistryEntry[] = [
 ];
 
 export function getProviderStatus(env: Env): Record<ProviderId, ProviderStatus> {
+  const policy = parseProviderPolicy(env.QUORUMMIND_PROVIDER_POLICY);
+
   return Object.fromEntries(
     providerRegistry.map((entry) => [
       entry.id,
@@ -184,7 +188,16 @@ export function getProviderStatus(env: Env): Record<ProviderId, ProviderStatus> 
         envKey: entry.envKey,
         modelEnvKey: entry.modelEnvKey,
         model: modelForStatus(entry, env),
-        notes: entry.notes
+        notes: entry.notes,
+        ...(entry.implemented
+          ? {
+              policy: evaluateProviderPolicy(
+                policy,
+                entry.id as ImplementedProviderId,
+                modelForStatus(entry, env)
+              )
+            }
+          : {})
       }
     ])
   ) as Record<ProviderId, ProviderStatus>;
@@ -192,7 +205,7 @@ export function getProviderStatus(env: Env): Record<ProviderId, ProviderStatus> 
 
 export function createConfiguredProviders(env: Env): ModelProvider[] {
   if (env.QUORUMMIND_MOCK_PROVIDERS === "1") {
-    return createMockProviderSet();
+    return createMockProviderSet().filter((provider) => isLiveModelAllowed(env, provider.id, provider.model));
   }
 
   const providers: ModelProvider[] = [];
@@ -200,7 +213,7 @@ export function createConfiguredProviders(env: Env): ModelProvider[] {
   const gatewayBaseUrl = modelGatewayBaseUrl(env);
 
   if (gatewayApiKey && gatewayBaseUrl) {
-    const gatewaySeats = seatsForGateway(env).filter((seat) => !isLiveModelDisabled(env, seat.providerId, seat.model));
+    const gatewaySeats = seatsForGateway(env).filter((seat) => isLiveModelAllowed(env, seat.providerId, seat.model));
 
     return gatewaySeats.map((seat) =>
       createModelGatewayProvider({
@@ -214,7 +227,7 @@ export function createConfiguredProviders(env: Env): ModelProvider[] {
 
   if (env.OPENAI_API_KEY) {
     const model = env.OPENAI_MODEL ?? defaultModelFor("openai");
-    if (!isLiveModelDisabled(env, "openai", model)) {
+    if (isLiveModelAllowed(env, "openai", model)) {
       providers.push(
         createOpenAIProvider({
           apiKey: env.OPENAI_API_KEY,
@@ -226,7 +239,7 @@ export function createConfiguredProviders(env: Env): ModelProvider[] {
 
   if (env.DEEPSEEK_API_KEY) {
     const model = env.DEEPSEEK_MODEL ?? defaultModelFor("deepseek");
-    if (!isLiveModelDisabled(env, "deepseek", model)) {
+    if (isLiveModelAllowed(env, "deepseek", model)) {
       providers.push(
         createDeepSeekProvider({
           apiKey: env.DEEPSEEK_API_KEY,
@@ -238,7 +251,7 @@ export function createConfiguredProviders(env: Env): ModelProvider[] {
 
   if (env.GEMINI_API_KEY) {
     const model = env.GEMINI_MODEL ?? defaultModelFor("gemini");
-    if (!isLiveModelDisabled(env, "gemini", model)) {
+    if (isLiveModelAllowed(env, "gemini", model)) {
       providers.push(
         createGeminiProvider({
           apiKey: env.GEMINI_API_KEY,
@@ -316,7 +329,15 @@ function modelsFromCommaSeparatedValue(value: string): string[] {
     .filter(Boolean);
 }
 
-function isLiveModelDisabled(env: Env, providerId: ImplementedProviderId, model: string): boolean {
+function isLiveModelAllowed(env: Env, providerId: ImplementedProviderId, model: string): boolean {
+  if (isLiveModelDisabledByLegacyList(env, providerId, model)) {
+    return false;
+  }
+
+  return isProviderPolicyAllowed(parseProviderPolicy(env.QUORUMMIND_PROVIDER_POLICY), providerId, model);
+}
+
+function isLiveModelDisabledByLegacyList(env: Env, providerId: ImplementedProviderId, model: string): boolean {
   const disabled = modelsFromCommaSeparatedValue(env.QUORUMMIND_DISABLED_LIVE_MODELS ?? "").map((item) => item.toLowerCase());
   const normalizedModel = model.toLowerCase();
   const providerScoped = `${providerId}:${normalizedModel}`;

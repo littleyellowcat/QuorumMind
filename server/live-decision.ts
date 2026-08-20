@@ -1,6 +1,10 @@
 import type { AgentRole, DecisionContext, DecisionMode } from "../src/lib/domain";
 import { defaultManualProviderAgents, type ManualProviderAgent } from "../src/lib/manual-provider";
 import type { ModelReputation } from "../src/lib/model-reputation";
+import { boundOutput, type BoundedOutputRef } from "./harness/bounded-output-store";
+import { classifyFailure, type FailureClassification } from "./harness/failure-taxonomy";
+import { createRunEventStore, defaultHarnessRootDir } from "./harness/run-event-store";
+import { createRunEventRecorder, type RunEvent, type RunEventRecorder } from "./harness/run-event-trace";
 import { createBlindReviewPayload, type BlindReviewPayload } from "./blind-review";
 import { parseProviderJson } from "./provider-json";
 import { normalizeProviderPayload, type NormalizedProviderPayload, type ProviderValidationIssue } from "./provider-schema";
@@ -26,9 +30,12 @@ export type LiveDecisionTraceEntry = {
   jsonParsed: boolean;
   validationStatus: "valid" | "repaired" | "invalid" | "unparsed";
   validationIssues: ProviderValidationIssue[];
+  failure?: FailureClassification;
   normalized?: NormalizedProviderPayload;
   failureClass?: "provider_error" | "json_parse_error" | "schema_validation_error";
   parsed?: unknown;
+  outputRef?: BoundedOutputRef;
+  events?: RunEvent[];
   error?: string;
 };
 
@@ -39,7 +46,9 @@ export type LiveDecisionTraceAttempt = {
   jsonParsed: boolean;
   validationStatus: "valid" | "repaired" | "invalid" | "unparsed";
   validationIssues: ProviderValidationIssue[];
+  failure?: FailureClassification;
   failureClass?: "provider_error" | "json_parse_error" | "schema_validation_error";
+  outputRef?: BoundedOutputRef;
   error?: string;
 };
 
@@ -53,6 +62,7 @@ type RunLiveDecisionTraceInput = {
   retryPolicy?: {
     maxAttempts?: number;
   };
+  runStoreDir?: string;
   context: DecisionContext;
 };
 
@@ -63,6 +73,19 @@ type PhasePayload = {
   critiques?: LiveDecisionTraceEntry[];
   revisions?: LiveDecisionTraceEntry[];
   rankings?: LiveDecisionTraceEntry[];
+};
+
+export type LiveDecisionTraceRunResult = {
+  runId: string;
+  trace: LiveDecisionTraceEntry[];
+  events: RunEvent[];
+  summary: {
+    providerCount: number;
+    entryCount: number;
+    failureCount: number;
+    retryCount: number;
+    truncatedOutputCount: number;
+  };
 };
 
 const fullLivePhases: ProviderPhase[] = ["proposal", "critique", "revision", "ranking", "verdict"];
@@ -76,9 +99,21 @@ const providerAgentIds: Record<ModelProvider["id"], ManualProviderAgent["id"] | 
 };
 
 export async function runLiveDecisionTrace(input: RunLiveDecisionTraceInput): Promise<LiveDecisionTraceEntry[]> {
+  return (await runLiveDecisionTraceDetailed(input)).trace;
+}
+
+export async function runLiveDecisionTraceDetailed(input: RunLiveDecisionTraceInput): Promise<LiveDecisionTraceRunResult> {
   const providers = input.providers.slice(0, 3);
   const trace: LiveDecisionTraceEntry[] = [];
   const runId = createRunId();
+  const runStoreDir = input.runStoreDir ?? defaultHarnessRootDir();
+  const eventRecorder = createRunEventRecorder({ runId });
+
+  eventRecorder.record({
+    type: "run_start",
+    severity: "info",
+    summary: `Live decision trace started with ${providers.length} provider(s).`
+  });
 
   for (const phase of phasesForMode(input.mode, input.maxPhases)) {
     const phaseEntries = await Promise.all(
@@ -89,7 +124,9 @@ export async function runLiveDecisionTrace(input: RunLiveDecisionTraceInput): Pr
           index,
           phase,
           input,
-          payload: payloadForPhase(phase, trace)
+          payload: payloadForPhase(phase, trace),
+          eventRecorder,
+          runStoreDir
         })
       )
     );
@@ -97,7 +134,31 @@ export async function runLiveDecisionTrace(input: RunLiveDecisionTraceInput): Pr
     trace.push(...phaseEntries);
   }
 
-  return trace;
+  eventRecorder.record({
+    type: "run_complete",
+    severity: "info",
+    summary: `Live decision trace completed with ${trace.length} provider phase entries.`
+  });
+  const allEvents = eventRecorder.events();
+
+  for (const entry of trace) {
+    entry.events = allEvents.filter((event) => event.phase === entry.phase && event.provider === entry.provider);
+  }
+
+  createRunEventStore({ rootDir: runStoreDir }).appendEvents(allEvents);
+
+  return {
+    runId,
+    trace,
+    events: allEvents,
+    summary: {
+      providerCount: providers.length,
+      entryCount: trace.length,
+      failureCount: trace.filter((entry) => entry.failure).length,
+      retryCount: trace.reduce((sum, entry) => sum + entry.retryCount, 0),
+      truncatedOutputCount: trace.filter((entry) => entry.outputRef?.truncated).length
+    }
+  };
 }
 
 async function runProviderPhase(input: {
@@ -107,6 +168,8 @@ async function runProviderPhase(input: {
   phase: ProviderPhase;
   input: RunLiveDecisionTraceInput;
   payload: PhasePayload;
+  eventRecorder: RunEventRecorder;
+  runStoreDir: string;
 }): Promise<LiveDecisionTraceEntry> {
   const agent = agentForProvider(input.provider, input.index, input.input.agentConfig);
   const agentRole = agent?.role ?? providerRoles[input.index] ?? "principal_architect";
@@ -126,9 +189,21 @@ async function runProviderPhase(input: {
     modelReputation: agent?.reputation
   };
   const attempts: LiveDecisionTraceAttempt[] = [];
+  const events = input.eventRecorder.child({
+    phase: input.phase,
+    provider: input.provider.id,
+    model: input.provider.model
+  });
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const startedAt = Date.now();
+    events.record({
+      type: "provider_attempt_start",
+      severity: "info",
+      attempt,
+      maxAttempts,
+      summary: `${input.provider.id}/${input.phase} attempt ${attempt} started.`
+    });
 
     try {
       const text = await input.provider.generateDecisionText({
@@ -148,6 +223,16 @@ async function runProviderPhase(input: {
       const schema = parsed === undefined ? undefined : normalizeProviderPayload(input.phase, parsed);
       const failureClass =
         parsed === undefined ? "json_parse_error" : schema && !schema.ok ? "schema_validation_error" : undefined;
+      const failure = failureClass
+        ? classifyFailure(failureClass, { fallbackCategory: failureClass })
+        : undefined;
+      const outputRef = boundOutput(text, {
+        label: `${input.provider.id}:${input.phase}:raw_output`,
+        storageDir: input.runStoreDir,
+        runId: input.runId,
+        redactSecrets: true
+      });
+      const boundedText = outputRef.inline ?? outputRef.preview;
       const attemptResult: LiveDecisionTraceAttempt = {
         attempt,
         status: "ok",
@@ -155,10 +240,23 @@ async function runProviderPhase(input: {
         jsonParsed: parsed !== undefined,
         validationStatus: schema?.validationStatus ?? "unparsed",
         validationIssues: schema?.issues ?? [],
-        failureClass
+        ...(failure ? { failure } : {}),
+        failureClass,
+        outputRef
       };
 
       attempts.push(attemptResult);
+      events.record({
+        type: failure ? attempt < maxAttempts ? "provider_attempt_retry" : "provider_attempt_failure" : "provider_attempt_success",
+        severity: failure ? failure.severity : "info",
+        attempt,
+        maxAttempts,
+        durationMs: attemptResult.durationMs,
+        summary: failure
+          ? `${input.provider.id}/${input.phase} returned ${failure.category}; ${attempt < maxAttempts ? "retrying" : "using bounded fallback"}.`
+          : `${input.provider.id}/${input.phase} produced ${schema?.validationStatus ?? "unparsed"} output.`,
+        ...(failure ? { failure } : {})
+      });
 
       if (!failureClass || attempt === maxAttempts) {
         return {
@@ -167,18 +265,22 @@ async function runProviderPhase(input: {
           retryCount: attempt - 1,
           attempts,
           status: "ok",
-          text,
+          text: boundedText,
           durationMs: attempts.reduce((sum, item) => sum + item.durationMs, 0),
           jsonParsed: parsed !== undefined,
           validationStatus: attemptResult.validationStatus,
           validationIssues: attemptResult.validationIssues,
+          ...(failure ? { failure } : {}),
           normalized: schema?.ok ? schema.normalized : undefined,
           failureClass,
-          parsed
+          parsed,
+          outputRef,
+          events: events.events()
         };
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown provider error";
+      const failure = classifyFailure(error, { fallbackCategory: "provider_error" });
       const attemptResult: LiveDecisionTraceAttempt = {
         attempt,
         status: "error",
@@ -186,11 +288,21 @@ async function runProviderPhase(input: {
         jsonParsed: false,
         validationStatus: "unparsed",
         validationIssues: [],
+        failure,
         failureClass: "provider_error",
         error: message
       };
 
       attempts.push(attemptResult);
+      events.record({
+        type: attempt === maxAttempts ? "provider_attempt_failure" : "provider_attempt_retry",
+        severity: failure.severity,
+        attempt,
+        maxAttempts,
+        durationMs: attemptResult.durationMs,
+        summary: `${input.provider.id}/${input.phase} failed with ${failure.category}; ${attempt < maxAttempts ? "retrying" : "attempt budget exhausted"}.`,
+        failure
+      });
 
       if (attempt === maxAttempts) {
         return {
@@ -204,7 +316,9 @@ async function runProviderPhase(input: {
           jsonParsed: false,
           validationStatus: "unparsed",
           validationIssues: [],
+          failure,
           failureClass: "provider_error",
+          events: events.events(),
           error: message
         };
       }

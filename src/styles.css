@@ -3940,6 +3940,74 @@ select:focus {
   padding: 12px;
 }
 
+.source-ledger-panel,
+.provider-policy-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.source-ledger-grid,
+.source-ledger-list,
+.provider-policy-list {
+  display: grid;
+  gap: 10px;
+}
+
+.source-ledger-grid {
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+}
+
+.source-ledger-grid article,
+.source-ledger-list article,
+.provider-policy-list article {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  background: var(--color-surface-muted);
+}
+
+.source-ledger-grid span,
+.source-ledger-list span,
+.provider-policy-list span {
+  display: block;
+  color: var(--color-primary-strong);
+  font-size: 0.7rem;
+  font-weight: 900;
+}
+
+.source-ledger-grid strong,
+.source-ledger-list strong,
+.provider-policy-list strong {
+  display: block;
+  margin-top: 5px;
+  color: var(--color-ink);
+  font-size: 0.9rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.source-ledger-grid small,
+.source-ledger-list small,
+.provider-policy-list small {
+  display: block;
+  margin-top: 6px;
+  color: var(--color-muted);
+  font-size: 0.76rem;
+  font-weight: 750;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.provider-policy-panel > strong {
+  color: var(--color-ink);
+  font-size: 0.9rem;
+}
+
+.provider-policy-list article.policy-denied {
+  border-color: color-mix(in oklch, var(--color-danger) 44%, var(--color-border));
+  background: color-mix(in oklch, var(--color-danger-soft) 74%, white);
+}
+
 .live-verdict-panel {
   border-color: oklch(0.78 0.08 190);
   background:

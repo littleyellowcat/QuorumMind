@@ -1,6 +1,7 @@
 import { runDecisionRoom } from "../src/lib/workflow";
 import { persistDecisionSummary } from "./decision-summarizer";
 import { buildKnowledgeInjection } from "./knowledge-inject";
+import { buildContextSourceLedger } from "./context-source-ledger";
 import { enrichBlueprintWithModelContributions, runBlueprintRoom } from "../src/lib/blueprint";
 import type { AgentRole, DecisionContext, DecisionMode } from "../src/lib/domain";
 import { decisionContextSchema, decisionModeSchema } from "../src/lib/domain";
@@ -10,10 +11,19 @@ import {
   type ManualProviderAgent
 } from "../src/lib/manual-provider";
 import { applyModelReputation, inferDecisionDomain, type DecisionDomain, type ModelReputationFeedback } from "../src/lib/model-reputation";
-import { runAutonomousBlueprintGraph } from "./agent-platform/autonomous-blueprint";
+import { runAutonomousBlueprintGraph, type AutonomousBlueprintRun } from "./agent-platform/autonomous-blueprint";
 import { GraphInterrupt } from "@langchain/langgraph";
+import { buildContextCompactionEvents, COMPRESSION_THRESHOLD, DEFAULT_MAX_TOKENS, estimateTokenCount } from "./context-compressor";
 import { aggregateLiveVerdict } from "./live-aggregation";
-import { runLiveDecisionTrace } from "./live-decision";
+import { createPermissionApprovalStore, type PermissionApprovalReply } from "./harness/permission-approval-store";
+import { createRunArtifactIndex } from "./harness/run-artifact-index";
+import { createRunCoordinator } from "./harness/run-coordinator";
+import { createRunEventStore, defaultHarnessRootDir } from "./harness/run-event-store";
+import type { RunEvent, RunEventType } from "./harness/run-event-trace";
+import { projectRunReadModel } from "./harness/run-read-model";
+import { createRunStatusStore, type RunStatusRecord } from "./harness/run-status-store";
+import { executeGovernedTool } from "./harness/tool-execution-runner";
+import { runLiveDecisionTrace, runLiveDecisionTraceDetailed } from "./live-decision";
 import { renderHtmlToPdf } from "./pdf-export";
 import { createSqliteDecisionRepository } from "./persistence/sqlite-repository";
 import { testProviderConnections } from "./provider-connectivity";
@@ -42,6 +52,7 @@ type DecisionPayload = {
 };
 
 type AgentRuntimeConfig = {
+  runId?: string;
   threadId?: string;
   maxConsensusRounds?: number;
   humanReviewNote?: string;
@@ -96,7 +107,8 @@ const decisionPayloadSchema = z.object({
 
 const pdfExportPayloadSchema = z.object({
   html: z.string().min(1).max(220_000),
-  filename: z.string().min(1).max(180).default("quorummind-final-result.pdf")
+  filename: z.string().min(1).max(180).default("quorummind-final-result.pdf"),
+  runId: z.string().min(1).max(180).optional()
 });
 
 export async function handleApiRequest(request: Request, env: Env = process.env): Promise<Response> {
@@ -169,6 +181,40 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
     return handleAutonomousBlueprintRequest(request, env);
   }
 
+  if (url.pathname === "/api/agent-runs" && request.method === "GET") {
+    return listAgentRuns(request, env);
+  }
+
+  const agentRunSubroute = parseAgentRunSubroute(url.pathname);
+
+  if (agentRunSubroute?.action === "events" && request.method === "GET") {
+    return listAgentRunEvents(request, env, agentRunSubroute.runId);
+  }
+
+  if (agentRunSubroute?.action === "read-model" && request.method === "GET") {
+    return openAgentRunReadModel(request, env, agentRunSubroute.runId);
+  }
+
+  if (agentRunSubroute?.action === "approval-reply" && request.method === "POST") {
+    return replyAgentRunApproval(request, env, agentRunSubroute.runId, agentRunSubroute.approvalId);
+  }
+
+  if (agentRunSubroute?.action === "interrupt" && request.method === "POST") {
+    return interruptAgentRun(request, env, agentRunSubroute.runId);
+  }
+
+  if (agentRunSubroute?.action === "wait" && request.method === "GET") {
+    return waitAgentRun(request, env, agentRunSubroute.runId);
+  }
+
+  if (agentRunSubroute?.action === "resume" && request.method === "POST") {
+    return resumeAgentRun(request, env, agentRunSubroute.runId);
+  }
+
+  if (agentRunSubroute?.action === "status" && request.method === "GET") {
+    return openAgentRunStatus(request, env, agentRunSubroute.runId);
+  }
+
   if (url.pathname !== "/api/decisions" || request.method !== "POST") {
     return json(request, env, { error: "Not found" }, 404);
   }
@@ -201,16 +247,30 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
   }, reputationFeedback);
   const knowledgeInjection = buildKnowledgeInjection(question, context);
   const result = runDecisionRoom({ question, mode, context, knowledgeInjection });
-  const providerTrace = shouldUseLiveProviders
-    ? await runLiveDecisionTrace({
+  const providerRun = shouldUseLiveProviders
+    ? await runLiveDecisionTraceDetailed({
         providers,
         question,
         locale,
         mode,
         agentConfig: reputationAdjustedAgents,
+        runStoreDir: runStoreRootForEnv(env),
         context
       })
-    : [];
+    : null;
+  const providerTrace = providerRun?.trace ?? [];
+  const contextLedger = buildContextSourceLedger({
+    question,
+    context,
+    knowledgeInjection,
+    reputationFeedback,
+    providerTrace,
+    fallbackReason: decisionFallbackReason({
+      requestedProviderMode,
+      providerTrace,
+      configuredProviderCount: providers.length
+    })
+  });
   const liveVerdict = shouldUseLiveProviders
     ? aggregateLiveVerdict({
         trace: providerTrace,
@@ -242,6 +302,7 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
     quorumScore: liveVerdict?.quorumScore ?? result.verdict.quorumScore,
     dissentIndex: liveVerdict?.dissentIndex ?? result.verdict.dissentIndex,
     providerTrace,
+    contextLedger,
     liveVerdict,
     promptBundle,
     result,
@@ -254,6 +315,8 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
     providerStatus: getProviderStatus(env),
     persistence,
     providerTrace,
+    contextLedger,
+    providerRun,
     liveVerdict,
     promptBundle,
     result
@@ -294,17 +357,32 @@ async function handleBlueprintRequest(request: Request, env: Env): Promise<Respo
     context
   });
   const blueprintQuestion = blueprintProviderQuestion(question, locale, blueprintSkillContext(question, context));
-  const providerTrace = shouldUseLiveProviders
-    ? await runLiveDecisionTrace({
+  const providerRun = shouldUseLiveProviders
+    ? await runLiveDecisionTraceDetailed({
         providers,
         question: blueprintQuestion,
         locale: locale,
         mode: mode === "fast" ? "deep" : mode,
         maxPhases: blueprintRuntime.maxProviderRounds,
         agentConfig: reputationAdjustedAgents,
+        runStoreDir: runStoreRootForEnv(env),
         context: context
       })
-    : [];
+    : null;
+  const providerTrace = providerRun?.trace ?? [];
+  const contextLedger = buildContextSourceLedger({
+    question,
+    context,
+    knowledgeInjection: blueprintQuestion,
+    reputationFeedback,
+    providerTrace,
+    fallbackReason: blueprintFallbackReason({
+      requested: blueprintRuntime.executionMode,
+      requestedProviderMode,
+      providerTrace,
+      configuredProviderCount: providers.length
+    })
+  });
   const blueprintExecution = summarizeBlueprintExecution({
     requested: blueprintRuntime.executionMode,
     requestedProviderMode,
@@ -324,6 +402,8 @@ async function handleBlueprintRequest(request: Request, env: Env): Promise<Respo
     providerStatus: getProviderStatus(env),
     persistence: persistenceStatusForEnv(env),
     providerTrace,
+    contextLedger,
+    providerRun,
     blueprintExecution,
     promptBundle,
     result
@@ -348,8 +428,34 @@ async function handlePdfExportRequest(request: Request, env: Env): Promise<Respo
   }
 
   try {
-    const pdf = await renderHtmlToPdf(parsed.data.html);
+    const governed = await executeGovernedTool({
+      runId: parsed.data.runId ?? createApiRunId("pdf-export"),
+      role: "executor_agent",
+      toolName: "quorummind_pdf_export",
+      node: "pdf_export",
+      objective: "render PDF/export artifact",
+      locale: "en",
+      execute: () => renderHtmlToPdf(parsed.data.html)
+    });
+
+    if (governed.status !== "executed") {
+      return json(request, env, {
+        status: governed.status,
+        permission: governed.permission
+      }, governed.status === "blocked" ? 403 : 409);
+    }
+
+    const pdf = governed.output;
     const filename = safePdfFilename(parsed.data.filename);
+    if (parsed.data.runId) {
+      createRunArtifactIndex({ rootDir: runStoreRootForEnv(env) }).add(parsed.data.runId, {
+        kind: "exported_pdf",
+        label: filename,
+        inline: {
+          bytes: pdf.byteLength
+        }
+      });
+    }
     const headers = applySecurityHeaders(
       new Headers({
         "Content-Type": "application/pdf",
@@ -399,13 +505,77 @@ async function handleAutonomousBlueprintRequest(request: Request, env: Env): Pro
   }, reputationFeedback);
   const blueprintQuestion = blueprintProviderQuestion(question, locale, blueprintSkillContext(question, context));
   const agentRuntime = parseAgentRuntimeConfig(payload.agentRuntime);
+  const runStoreRoot = runStoreRootForEnv(env);
+  const runStore = createRunStatusStore({ rootDir: runStoreRoot });
+  const eventStore = createRunEventStore({ rootDir: runStoreRoot });
+  const artifactIndex = createRunArtifactIndex({ rootDir: runStoreRoot });
+  const coordinator = createRunCoordinator({ rootDir: runStoreRoot });
+  const runId = agentRuntime.runId ?? createApiRunId("agent-blueprint");
+  const startedAt = new Date().toISOString();
+  const start = coordinator.start(runId);
 
-  try {
-    const run = await runAutonomousBlueprintGraph({
+  if (!start.accepted) {
+    const wake = coordinator.wake(runId, {
+      source: "api_request",
+      note: "Duplicate autonomous blueprint request coalesced into the active run."
+    });
+    return json(request, env, {
+      status: "already_running",
+      message: "An agent run with the same runId is already active.",
+      runId,
+      wake
+    }, 409);
+  }
+
+  runStore.save({
+    runId,
+    kind: "autonomous_blueprint",
+    status: "running",
+    threadId: agentRuntime.threadId ?? "quorummind-agent-thread",
+    createdAt: startedAt,
+    updatedAt: startedAt,
+    summary: question.slice(0, 160),
+    requestSnapshot: {
       question,
       mode,
       locale,
       context,
+      agentConfig: reputationAdjustedAgents,
+      reputationFeedback,
+      blueprintRuntime,
+      agentRuntime
+    }
+  });
+  appendRunEvent(eventStore, runId, "run_start", "info", `Autonomous blueprint run started for ${locale} request.`);
+  artifactIndex.add(runId, {
+    kind: "event_log",
+    label: "run event stream",
+    path: eventStore.eventLogPath(runId)
+  });
+  artifactIndex.add(runId, {
+    kind: "run_status",
+    label: "run status record",
+    path: runStore.recordPath(runId)
+  });
+  artifactIndex.add(runId, {
+    kind: "resume_snapshot",
+    label: "checkpoint-aware request snapshot",
+    inline: {
+      threadId: agentRuntime.threadId ?? "quorummind-agent-thread",
+      question,
+      mode,
+      locale
+    }
+  });
+
+  try {
+    const run = await runAutonomousBlueprintGraph({
+      runId,
+      question,
+      mode,
+      locale,
+      context,
+      runStoreDir: runStoreRoot,
       liveModel:
         blueprintRuntime.executionMode === "live"
           ? {
@@ -425,6 +595,7 @@ async function handleAutonomousBlueprintRequest(request: Request, env: Env): Pro
                       mode: mode === "fast" ? "deep" : mode,
                       maxPhases: blueprintRuntime.maxProviderRounds,
                       agentConfig: reputationAdjustedAgents,
+                      runStoreDir: runStoreRoot,
                       context: context
                     })
                 : undefined
@@ -432,6 +603,25 @@ async function handleAutonomousBlueprintRequest(request: Request, env: Env): Pro
           : { requested: false, unavailableReason: "deterministic_mode" },
       ...agentRuntime
     });
+    appendAutonomousTraceEvents(eventStore, run);
+    appendAutonomousRunArtifacts(artifactIndex, run);
+    appendRunEvent(
+      eventStore,
+      run.runId,
+      "run_complete",
+      run.summary.humanReviewRequired ? "warning" : "info",
+      `Autonomous blueprint run completed with status ${run.summary.terminationReason}.`
+    );
+    runStore.update(
+      run.runId,
+      runStatusPatchFromAutonomousRun(run, run.summary.humanReviewRequired ? "paused" : "completed")
+    );
+    if (run.summary.humanReviewRequired) {
+      coordinator.pause(run.runId, "paused_for_human_review");
+    } else {
+      coordinator.complete(run.runId, "completed");
+    }
+    projectRunReadModelBestEffort(runStoreRoot, run.runId);
 
     return json(request, env, {
       providerMode: run.liveModel.liveTraceAttempted ? "live" : "demo",
@@ -444,6 +634,18 @@ async function handleAutonomousBlueprintRequest(request: Request, env: Env): Pro
       // Human-in-the-loop: the graph paused at human_review_gate.
       // Return the interrupt payload so the user can review and resume.
       const interrupts = (error as any).interrupts ?? [];
+      appendRunEvent(eventStore, runId, "run_complete", "warning", "Autonomous blueprint paused for human review.");
+      runStore.update(runId, {
+        status: "paused",
+        updatedAt: new Date().toISOString(),
+        threadId: agentRuntime.threadId ?? "quorummind-agent-thread",
+        resumeHint:
+          locale === "zh"
+            ? "在 agentRuntime.humanReviewNote 中填写复审意见后重新提交。"
+            : "Submit agentRuntime.humanReviewNote to continue from human review."
+      });
+      coordinator.pause(runId, "paused_for_human_review");
+      projectRunReadModelBestEffort(runStoreRoot, runId);
       return json(request, env, {
         status: "paused_for_review",
         message:
@@ -462,8 +664,17 @@ async function handleAutonomousBlueprintRequest(request: Request, env: Env): Pro
           locale === "zh"
             ? `发送 POST /api/agent-runs/blueprint 并在 agentRuntime.humanReviewNote 中填写复审意见以继续。`
             : `POST /api/agent-runs/blueprint with agentRuntime.humanReviewNote set to your review to resume.`
-      }, 200);
+        }, 200);
     }
+    appendRunEvent(eventStore, runId, "run_complete", "error", error instanceof Error ? error.message : "Unknown autonomous blueprint failure");
+    runStore.update(runId, {
+      status: "failed",
+      threadId: agentRuntime.threadId,
+      updatedAt: new Date().toISOString(),
+      error: error instanceof Error ? error.message : "Unknown autonomous blueprint failure"
+    });
+    coordinator.complete(runId, "failed");
+    projectRunReadModelBestEffort(runStoreRoot, runId);
     throw error;
   }
 }
@@ -494,6 +705,466 @@ function isBlueprintSkill(skill: SkillMeta): boolean {
   return skill.inject === "blueprint" || skill.inject === "both";
 }
 
+function openAgentRunStatus(request: Request, env: Env, runId: string): Response {
+  const rootDir = runStoreRootForEnv(env);
+  const store = createRunStatusStore({ rootDir });
+  const events = createRunEventStore({ rootDir }).listEvents(runId);
+  const artifacts = createRunArtifactIndex({ rootDir }).list(runId);
+  const run = store.find(runId);
+
+  if (!run) {
+    return json(request, env, { error: "Agent run not found." }, 404);
+  }
+
+  return json(request, env, {
+    run,
+    events,
+    artifacts
+  });
+}
+
+function openAgentRunReadModel(request: Request, env: Env, runId: string): Response {
+  const rootDir = runStoreRootForEnv(env);
+  const status = createRunStatusStore({ rootDir }).find(runId);
+  const events = createRunEventStore({ rootDir }).listEvents(runId);
+
+  if (!status && events.length === 0) {
+    return json(request, env, { error: "Agent run not found." }, 404);
+  }
+
+  return json(request, env, projectRunReadModel({ rootDir, runId }));
+}
+
+function listAgentRunEvents(request: Request, env: Env, runId: string): Response {
+  const url = new URL(request.url);
+  const rootDir = runStoreRootForEnv(env);
+  const after = Number(url.searchParams.get("after") ?? 0);
+  const events = createRunEventStore({ rootDir }).listEvents(runId, {
+    after: Number.isFinite(after) ? after : 0
+  });
+  const nextAfter = events.at(-1)?.seq ?? (Number.isFinite(after) ? after : 0);
+
+  if (url.searchParams.get("stream") === "sse") {
+    const headers = applySecurityHeaders(
+      new Headers({
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive"
+      }),
+      request,
+      env
+    );
+    const body = events
+      .map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n`)
+      .join("\n");
+
+    return new Response(body, { status: 200, headers });
+  }
+
+  return json(request, env, {
+    events,
+    nextAfter
+  });
+}
+
+async function replyAgentRunApproval(request: Request, env: Env, runId: string, approvalId: string): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = parsePermissionApprovalReply(payload);
+
+  if (!parsed) {
+    return json(request, env, { error: "Approval reply must be approve, reject, or always." }, 400);
+  }
+
+  const store = createPermissionApprovalStore({ rootDir: runStoreRootForEnv(env) });
+  const approval = store.reply(approvalId, parsed);
+
+  if (!approval || approval.runId !== runId) {
+    return json(request, env, { error: "Permission approval not found." }, 404);
+  }
+
+  return json(request, env, { approval });
+}
+
+function listAgentRuns(request: Request, env: Env): Response {
+  const url = new URL(request.url);
+  const limit = Number(url.searchParams.get("limit") ?? 20);
+  const store = createRunStatusStore({ rootDir: runStoreRootForEnv(env) });
+
+  return json(request, env, {
+    runs: store.list({ limit: Number.isFinite(limit) ? limit : 20 })
+  });
+}
+
+async function resumeAgentRun(request: Request, env: Env, runId: string): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const rootDir = runStoreRootForEnv(env);
+  const store = createRunStatusStore({ rootDir });
+  const eventStore = createRunEventStore({ rootDir });
+  const artifactIndex = createRunArtifactIndex({ rootDir });
+  const coordinator = createRunCoordinator({ rootDir });
+  const run = store.find(runId);
+
+  if (!run) {
+    return json(request, env, { error: "Agent run not found." }, 404);
+  }
+
+  if (run.status !== "paused") {
+    return json(
+      request,
+      env,
+      {
+        status: "not_resumable",
+        message: "Only paused autonomous blueprint runs can be resumed.",
+        run
+      },
+      409
+    );
+  }
+
+  const snapshot = parseResumeSnapshot(run.requestSnapshot);
+  const humanReviewNote =
+    typeof payload === "object" && payload !== null && typeof (payload as { humanReviewNote?: unknown }).humanReviewNote === "string"
+      ? (payload as { humanReviewNote: string }).humanReviewNote.trim()
+      : "";
+
+  if (!snapshot || !run.checkpoint?.threadId) {
+    return json(
+      request,
+      env,
+      {
+        status: "not_resumable",
+        message: "Paused run is missing checkpoint-aware request context.",
+        run
+      },
+      409
+    );
+  }
+
+  store.update(runId, {
+    status: "running",
+    updatedAt: new Date().toISOString(),
+    resumeHint: "Resume request accepted and is re-entering the saved LangGraph thread."
+  });
+  coordinator.start(runId);
+  appendRunEvent(eventStore, runId, "human_review_pause", "info", "Human review note received; resuming saved LangGraph thread.");
+  const resumed = await runAutonomousBlueprintGraph({
+    runId,
+    question: snapshot.question,
+    mode: snapshot.mode,
+    locale: snapshot.locale,
+    context: snapshot.context,
+    runStoreDir: rootDir,
+    threadId: run.checkpoint.threadId,
+    maxConsensusRounds: Math.max(snapshot.agentRuntime.maxConsensusRounds ?? 3, 3),
+    humanReviewNote: humanReviewNote || snapshot.agentRuntime.humanReviewNote,
+    liveModel: { requested: false, unavailableReason: "deterministic_mode" }
+  });
+  appendAutonomousTraceEvents(eventStore, resumed);
+  appendAutonomousRunArtifacts(artifactIndex, resumed);
+  appendRunEvent(eventStore, runId, "run_complete", "info", "Autonomous blueprint run resumed through saved checkpoint context.");
+  store.update(runId, runStatusPatchFromAutonomousRun(resumed, resumed.summary.humanReviewRequired ? "paused" : "completed"));
+  if (resumed.summary.humanReviewRequired) {
+    coordinator.pause(runId, "paused_for_human_review");
+  } else {
+    coordinator.complete(runId, "completed");
+  }
+  projectRunReadModelBestEffort(rootDir, runId);
+
+  return json(request, env, {
+    status: "resumed",
+    run: resumed
+  });
+}
+
+async function interruptAgentRun(request: Request, env: Env, runId: string): Promise<Response> {
+  let payload: unknown = {};
+
+  try {
+    payload = await request.json();
+  } catch {
+    payload = {};
+  }
+
+  const reason =
+    typeof payload === "object" && payload !== null && typeof (payload as { reason?: unknown }).reason === "string"
+      ? (payload as { reason: string }).reason.trim()
+      : "interrupted";
+  const rootDir = runStoreRootForEnv(env);
+  const store = createRunStatusStore({ rootDir });
+  const current = store.find(runId);
+  const terminal = createRunCoordinator({ rootDir }).interrupt(runId, reason || "interrupted");
+
+  if (current) {
+    store.update(runId, {
+      status: "interrupted",
+      updatedAt: terminal.updatedAt,
+      error: reason || "interrupted"
+    });
+  }
+  appendRunEvent(createRunEventStore({ rootDir }), runId, "run_complete", "warning", `Run interrupted: ${reason || "interrupted"}`);
+  projectRunReadModelBestEffort(rootDir, runId);
+
+  return json(request, env, terminal);
+}
+
+async function waitAgentRun(request: Request, env: Env, runId: string): Promise<Response> {
+  const rootDir = runStoreRootForEnv(env);
+  const coordinator = createRunCoordinator({ rootDir });
+  const status = createRunStatusStore({ rootDir }).find(runId);
+
+  if (!coordinator.activeRuns().includes(runId)) {
+    return json(request, env, {
+      runId,
+      status: status?.status ?? "not_found",
+      updatedAt: status?.updatedAt,
+      reason: status?.error ?? (status?.status === "running" ? "no active coordinator in this process" : undefined)
+    });
+  }
+
+  return json(request, env, await coordinator.wait(runId));
+}
+
+function parseAgentRunSubroute(pathname: string):
+  | {
+      runId: string;
+      action: "status" | "events" | "interrupt" | "wait" | "resume" | "read-model";
+    }
+  | {
+      runId: string;
+      action: "approval-reply";
+      approvalId: string;
+    }
+  | undefined {
+  const prefix = "/api/agent-runs/";
+  if (!pathname.startsWith(prefix)) {
+    return undefined;
+  }
+
+  const parts = pathname.slice(prefix.length).split("/");
+  const runId = decodeURIComponent(parts[0] ?? "");
+  const action = parts[1] as "events" | "interrupt" | "wait" | "resume" | "read-model" | "approvals" | undefined;
+
+  if (!runId) {
+    return undefined;
+  }
+
+  if (action === "approvals" && parts[2] && parts[3] === "reply") {
+    return {
+      runId,
+      action: "approval-reply",
+      approvalId: decodeURIComponent(parts[2])
+    };
+  }
+
+  if (action === "events" || action === "interrupt" || action === "wait" || action === "resume" || action === "read-model") {
+    return { runId, action };
+  }
+
+  return { runId, action: "status" };
+}
+
+function parsePermissionApprovalReply(value: unknown): PermissionApprovalReply | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+
+  const candidate = value as { reply?: unknown; message?: unknown };
+  if (candidate.reply !== "approve" && candidate.reply !== "reject" && candidate.reply !== "always") {
+    return undefined;
+  }
+
+  return {
+    reply: candidate.reply,
+    ...(typeof candidate.message === "string" && candidate.message.trim() ? { message: candidate.message.trim() } : {})
+  };
+}
+
+function runStoreRootForEnv(env: Env): string {
+  return env.QUORUMMIND_RUN_STORE_DIR ?? defaultHarnessRootDir();
+}
+
+function createApiRunId(prefix: string): string {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function appendRunEvent(
+  store: ReturnType<typeof createRunEventStore>,
+  runId: string,
+  type: RunEventType,
+  severity: RunEvent["severity"],
+  summary: string
+): void {
+  store.appendEvent({
+    runId,
+    seq: 0,
+    timestamp: new Date().toISOString(),
+    type,
+    severity,
+    summary,
+    truncated: false
+  });
+}
+
+function appendAutonomousTraceEvents(
+  store: ReturnType<typeof createRunEventStore>,
+  run: AutonomousBlueprintRun
+): void {
+  if (run.trace.some((entry) => entry.node === "route_intent")) {
+    appendRunEvent(store, run.runId, "route_intent_start", "info", "LangGraph route_intent node entered.");
+  }
+
+  if (run.trace.some((entry) => entry.node === "planner_agent")) {
+    appendRunEvent(store, run.runId, "planner_complete", "info", "Planner Agent completed task decomposition.");
+  }
+
+  if (run.criticReviews.some((review) => review.status !== "pass")) {
+    appendRunEvent(store, run.runId, "critic_warn", "warning", "Critic Agent reported review warnings.");
+  }
+
+  if (run.summary.humanReviewRequired || run.trace.some((entry) => entry.node === "human_review_gate")) {
+    appendRunEvent(store, run.runId, "human_review_pause", "warning", "Run requires human review before final acceptance.");
+  }
+
+  if (typeof run.contextCompressedAt === "number") {
+    for (const event of buildContextCompactionEvents({
+      roundNumber: run.contextCompressedAt,
+      fillRatio: COMPRESSION_THRESHOLD,
+      tokenCountBefore: Math.ceil(COMPRESSION_THRESHOLD * DEFAULT_MAX_TOKENS),
+      tokenCountAfter: estimateTokenCount(run.contextSummary ?? "")
+    })) {
+      appendRunEvent(store, run.runId, event.type, event.severity, event.summary);
+    }
+  }
+}
+
+function projectRunReadModelBestEffort(rootDir: string, runId: string): void {
+  try {
+    projectRunReadModel({ rootDir, runId });
+  } catch {
+    // Read models are derived audit artifacts; request handling should not fail if projection fails.
+  }
+}
+
+function runStatusPatchFromAutonomousRun(
+  run: AutonomousBlueprintRun,
+  status: RunStatusRecord["status"]
+): Partial<Omit<RunStatusRecord, "runId" | "createdAt">> {
+  return {
+    kind: "autonomous_blueprint",
+    status,
+    threadId: run.checkpoint.threadId,
+    updatedAt: new Date().toISOString(),
+    summary: `${run.summary.title} · consensus ${run.summary.consensusScore}`,
+    checkpoint: run.checkpoint,
+    resumeHint: run.summary.humanReviewRequired
+      ? "Human review required before continuing this run."
+      : undefined
+  };
+}
+
+function appendAutonomousRunArtifacts(
+  artifactIndex: ReturnType<typeof createRunArtifactIndex>,
+  run: AutonomousBlueprintRun
+): void {
+  artifactIndex.add(run.runId, {
+    kind: "prompt_bundle",
+    label: "autonomous blueprint request",
+    inline: {
+      question: run.question,
+      mode: run.mode,
+      locale: run.locale,
+      intent: run.intent.category
+    }
+  });
+  artifactIndex.add(run.runId, {
+    kind: "resume_snapshot",
+    label: "checkpoint resume context",
+    inline: {
+      threadId: run.checkpoint.threadId,
+      saver: run.checkpoint.saver,
+      maxConsensusRounds: run.runtimeLimits.maxConsensusRounds
+    }
+  });
+
+  if (run.providerTrace.length > 0) {
+    artifactIndex.add(run.runId, {
+      kind: "provider_trace",
+      label: "live provider trace",
+      inline: {
+        providerCalls: run.providerTrace.length,
+        usableCalls: run.liveModel.usableCalls
+      }
+    });
+  }
+
+  for (const toolCall of run.toolCalls) {
+    if (!toolCall.outputRef) {
+      continue;
+    }
+
+    artifactIndex.add(run.runId, {
+      kind: "bounded_output",
+      label: toolCall.outputRef.label,
+      path: toolCall.outputRef.path,
+      sha256: toolCall.outputRef.sha256,
+      metadata: {
+        toolName: toolCall.toolName,
+        node: toolCall.node,
+        truncated: toolCall.outputRef.truncated,
+        redacted: toolCall.outputRef.redacted ?? false
+      }
+    });
+  }
+}
+
+type ResumeSnapshot = {
+  question: string;
+  mode: DecisionMode;
+  locale: "en" | "zh";
+  context: DecisionContext;
+  blueprintRuntime: BlueprintRuntimeConfig;
+  agentRuntime: AgentRuntimeConfig;
+};
+
+function parseResumeSnapshot(value: unknown): ResumeSnapshot | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  const question = typeof candidate.question === "string" ? candidate.question : undefined;
+  const mode = decisionModeSchema.safeParse(candidate.mode);
+  const locale = z.enum(["en", "zh"]).safeParse(candidate.locale);
+  const context = decisionContextSchema.safeParse(candidate.context);
+
+  if (!question || !mode.success || !locale.success || !context.success) {
+    return undefined;
+  }
+
+  return {
+    question,
+    mode: mode.data,
+    locale: locale.data,
+    context: context.data,
+    blueprintRuntime: parseBlueprintRuntimeConfig(candidate.blueprintRuntime),
+    agentRuntime: parseAgentRuntimeConfig(candidate.agentRuntime)
+  };
+}
+
 
 function parseAgentRuntimeConfig(value: unknown): AgentRuntimeConfig {
   if (typeof value !== "object" || value === null) {
@@ -501,6 +1172,7 @@ function parseAgentRuntimeConfig(value: unknown): AgentRuntimeConfig {
   }
 
   const candidate = value as Partial<Record<keyof AgentRuntimeConfig, unknown>>;
+  const runId = nonEmptyString(candidate.runId);
   const threadId = nonEmptyString(candidate.threadId);
   const maxConsensusRounds =
     typeof candidate.maxConsensusRounds === "number" && Number.isInteger(candidate.maxConsensusRounds)
@@ -509,6 +1181,7 @@ function parseAgentRuntimeConfig(value: unknown): AgentRuntimeConfig {
   const humanReviewNote = nonEmptyString(candidate.humanReviewNote);
 
   return {
+    ...(runId ? { runId } : {}),
     ...(threadId ? { threadId } : {}),
     ...(maxConsensusRounds ? { maxConsensusRounds } : {}),
     ...(humanReviewNote ? { humanReviewNote } : {})
@@ -562,6 +1235,43 @@ function summarizeBlueprintExecution(input: {
               ? "no_usable_live_trace"
               : "no_configured_providers"
   };
+}
+
+function decisionFallbackReason(input: {
+  requestedProviderMode: "demo" | "live";
+  configuredProviderCount: number;
+  providerTrace: Awaited<ReturnType<typeof runLiveDecisionTrace>>;
+}): string {
+  if (input.requestedProviderMode !== "live") {
+    return "provider_mode_demo";
+  }
+
+  if (input.providerTrace.length > 0 && countUsableTraceEntries(input.providerTrace) > 0) {
+    return "none";
+  }
+
+  return input.configuredProviderCount === 0 ? "no_configured_providers" : "no_usable_live_trace";
+}
+
+function blueprintFallbackReason(input: {
+  requested: BlueprintExecutionMode;
+  requestedProviderMode: "demo" | "live";
+  configuredProviderCount: number;
+  providerTrace: Awaited<ReturnType<typeof runLiveDecisionTrace>>;
+}): string {
+  if (input.requested === "deterministic") {
+    return "deterministic_mode";
+  }
+
+  if (input.requestedProviderMode !== "live") {
+    return "provider_mode_demo";
+  }
+
+  if (input.providerTrace.length > 0 && countUsableTraceEntries(input.providerTrace) > 0) {
+    return "none";
+  }
+
+  return input.configuredProviderCount === 0 ? "no_configured_providers" : "no_usable_live_trace";
 }
 
 function countUsableTraceEntries(trace: Awaited<ReturnType<typeof runLiveDecisionTrace>>): number {
@@ -678,6 +1388,7 @@ function persistDecisionRoomIfConfigured(
     quorumScore: number;
     dissentIndex: number;
     providerTrace: Awaited<ReturnType<typeof runLiveDecisionTrace>>;
+    contextLedger: ReturnType<typeof buildContextSourceLedger>;
     liveVerdict: ReturnType<typeof aggregateLiveVerdict>;
     promptBundle: ReturnType<typeof createManualProviderBundle>;
     result: ReturnType<typeof runDecisionRoom>;
@@ -708,6 +1419,7 @@ function persistDecisionRoomIfConfigured(
       quorumScore: input.quorumScore,
       dissentIndex: input.dissentIndex,
       providerTrace: input.providerTrace,
+      contextLedger: input.contextLedger,
       liveVerdict: input.liveVerdict,
       promptBundle: input.promptBundle,
       result: input.result,

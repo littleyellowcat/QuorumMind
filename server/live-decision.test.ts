@@ -2,7 +2,7 @@
 import { describe, expect, it } from "vitest";
 import type { DecisionContext } from "../src/lib/domain";
 import type { ManualProviderAgent } from "../src/lib/manual-provider";
-import { runLiveDecisionTrace } from "./live-decision";
+import { runLiveDecisionTrace, runLiveDecisionTraceDetailed } from "./live-decision";
 import type { ModelProvider, ProviderRequest } from "./providers";
 
 const context: DecisionContext = {
@@ -423,6 +423,93 @@ describe("runLiveDecisionTrace", () => {
           validationStatus: "valid"
         })
       ]
+    });
+  });
+
+  it("records standardized failures, ordered events, and bounded output refs", async () => {
+    const longProvider: ModelProvider = {
+      id: "openai",
+      model: "long-output-model",
+      async generateDecisionText() {
+        return `not-json ${"x".repeat(3000)}`;
+      }
+    };
+
+    const trace = await runLiveDecisionTrace({
+      providers: [longProvider],
+      question: "Should we use shared tables?",
+      locale: "en",
+      mode: "fast",
+      maxPhases: 1,
+      context
+    });
+
+    expect(trace[0]).toMatchObject({
+      failureClass: "json_parse_error",
+      failure: expect.objectContaining({
+        category: "json_parse_error",
+        retryability: "repairable"
+      }),
+      outputRef: expect.objectContaining({
+        label: "openai:proposal:raw_output",
+        truncated: true,
+        originalChars: expect.any(Number),
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/)
+      })
+    });
+    expect(trace[0].text.length).toBeLessThan(1300);
+    expect(trace[0].events?.map((event) => event.type)).toEqual([
+      "provider_attempt_start",
+      "provider_attempt_failure"
+    ]);
+    expect(trace[0].events?.map((event) => event.seq)).toEqual([2, 3]);
+  });
+
+  it("returns a detailed run-level event stream and summary when requested", async () => {
+    const validProvider: ModelProvider = {
+      id: "openai",
+      model: "valid-detailed-model",
+      async generateDecisionText() {
+        return JSON.stringify({
+          proposalId: "shared-table",
+          recommendation: "Use shared tables.",
+          criteriaScores: {
+            scalability: 80,
+            reliability: 80,
+            security: 80,
+            costEfficiency: 80,
+            implementationComplexity: 80,
+            maintainability: 80,
+            migrationFlexibility: 80,
+            teamFit: 80,
+            timeToMarket: 80,
+            reversibility: 80
+          },
+          confidence: 0.8
+        });
+      }
+    };
+    const detailed = await runLiveDecisionTraceDetailed({
+      providers: [validProvider],
+      question: "Should we use shared tables?",
+      locale: "en",
+      mode: "fast",
+      maxPhases: 1,
+      context
+    });
+
+    expect(detailed.trace).toHaveLength(1);
+    expect(detailed.events.map((event) => event.type)).toEqual([
+      "run_start",
+      "provider_attempt_start",
+      "provider_attempt_success",
+      "run_complete"
+    ]);
+    expect(detailed.summary).toMatchObject({
+      providerCount: 1,
+      entryCount: 1,
+      failureCount: 0,
+      retryCount: 0
     });
   });
 });

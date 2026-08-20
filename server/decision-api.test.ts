@@ -1,11 +1,16 @@
 // @vitest-environment node
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { handleApiRequest } from "./decision-api";
 import type { DecisionContext } from "../src/lib/domain";
 import { createSqliteDecisionRepository } from "./persistence/sqlite-repository";
+import { createRunArtifactIndex } from "./harness/run-artifact-index";
+import { createRunEventStore } from "./harness/run-event-store";
+import { createRunStatusStore } from "./harness/run-status-store";
+import { createPermissionApprovalStore } from "./harness/permission-approval-store";
+import { createPermissionApprovalRecord, decideToolPermission } from "./harness/tool-governance";
 
 const context: DecisionContext = {
   productStage: "mvp",
@@ -40,6 +45,18 @@ describe("handleApiRequest", () => {
     expect(body.providerMode).toBe("demo");
     expect(body.result.verdict.adrMarkdown).toContain("# ADR:");
     expect(body.result.verdict.rankedProposals.length).toBeGreaterThan(0);
+    expect(body.contextLedger).toMatchObject({
+      schemaVersion: 1,
+      fallback: {
+        used: true,
+        reason: "provider_mode_demo"
+      },
+      providerEvidence: {
+        attempted: false,
+        usableCalls: 0
+      }
+    });
+    expect(body.contextLedger.contextHash).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it("returns a demo blueprint result for open-ended blueprint requests", async () => {
@@ -231,6 +248,14 @@ describe("handleApiRequest", () => {
         proposalId: expect.any(String)
       })
     });
+    expect(body.providerRun).toMatchObject({
+      summary: {
+        providerCount: 3,
+        entryCount: 9,
+        failureCount: 0
+      }
+    });
+    expect(body.providerRun.events.map((event: { type: string }) => event.type)).toContain("run_complete");
     expect(body.liveVerdict).toMatchObject({
       source: "live",
       selectedProposalId: expect.any(String),
@@ -260,6 +285,11 @@ describe("handleApiRequest", () => {
     expect(response.status).toBe(200);
     expect(body.providerMode).toBe("live");
     expect(body.providerTrace).toHaveLength(15);
+    expect(body.providerRun.summary).toMatchObject({
+      providerCount: 3,
+      entryCount: 15,
+      failureCount: 0
+    });
     expect(body.blueprintExecution).toMatchObject({
       requested: "live",
       actual: "live",
@@ -390,6 +420,199 @@ describe("handleApiRequest", () => {
       "quorummind_live_understand_request_trace"
     );
     expect(body.run.toolCalls.map((entry: { source: string }) => entry.source)).toContain("live_model_provider");
+  });
+
+  it("replays agent run events incrementally and as an SSE stream", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-api-events-"));
+    const eventStore = createRunEventStore({ rootDir });
+
+    eventStore.appendEvent({
+      runId: "run-1",
+      seq: 0,
+      timestamp: "2026-08-20T12:00:00.000Z",
+      type: "run_start",
+      severity: "info",
+      summary: "started",
+      truncated: false
+    });
+    eventStore.appendEvent({
+      runId: "run-1",
+      seq: 0,
+      timestamp: "2026-08-20T12:00:01.000Z",
+      type: "planner_complete",
+      severity: "info",
+      summary: "planned",
+      truncated: false
+    });
+
+    const jsonResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/agent-runs/run-1/events?after=1"),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const jsonBody = await jsonResponse.json();
+    const sseResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/agent-runs/run-1/events?after=1&stream=sse"),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const sseText = await sseResponse.text();
+
+    expect(jsonResponse.status).toBe(200);
+    expect(jsonBody.events).toEqual([
+      expect.objectContaining({ seq: 2, type: "planner_complete", schemaVersion: 1 })
+    ]);
+    expect(jsonBody.nextAfter).toBe(2);
+    expect(sseResponse.headers.get("Content-Type")).toContain("text/event-stream");
+    expect(sseText).toContain("event: planner_complete");
+    expect(sseText).toContain("\"seq\":2");
+  });
+
+  it("exposes run artifacts and supports interrupt and wait runtime coordination endpoints", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-api-coordinator-"));
+    const statusStore = createRunStatusStore({ rootDir });
+    const artifacts = createRunArtifactIndex({ rootDir });
+
+    statusStore.save({
+      runId: "run-1",
+      kind: "autonomous_blueprint",
+      status: "running",
+      createdAt: "2026-08-20T12:00:00.000Z",
+      updatedAt: "2026-08-20T12:00:00.000Z"
+    });
+    artifacts.add("run-1", {
+      kind: "prompt_bundle",
+      label: "prompt bundle",
+      inline: { promptCount: 3 }
+    });
+
+    const detailResponse = await handleApiRequest(new Request("http://127.0.0.1:8787/api/agent-runs/run-1"), {
+      QUORUMMIND_RUN_STORE_DIR: rootDir
+    });
+    const detailBody = await detailResponse.json();
+    const interruptResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/agent-runs/run-1/interrupt", {
+        method: "POST",
+        body: JSON.stringify({ reason: "manual stop" })
+      }),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const interruptBody = await interruptResponse.json();
+    const waitResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/agent-runs/run-1/wait"),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const waitBody = await waitResponse.json();
+
+    expect(detailBody.artifacts).toEqual([
+      expect.objectContaining({ kind: "prompt_bundle", label: "prompt bundle" })
+    ]);
+    expect(interruptResponse.status).toBe(200);
+    expect(interruptBody.status).toBe("interrupted");
+    expect(waitBody).toMatchObject({
+      runId: "run-1",
+      status: "interrupted",
+      reason: "manual stop"
+    });
+  });
+
+  it("projects an agent run read model through the API", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-api-read-model-"));
+    const statusStore = createRunStatusStore({ rootDir });
+    const eventStore = createRunEventStore({ rootDir });
+    const artifacts = createRunArtifactIndex({ rootDir });
+
+    statusStore.save({
+      runId: "run-1",
+      kind: "autonomous_blueprint",
+      status: "completed",
+      createdAt: "2026-08-20T12:00:00.000Z",
+      updatedAt: "2026-08-20T12:00:04.000Z",
+      summary: "read model test"
+    });
+    eventStore.appendEvent({
+      runId: "run-1",
+      seq: 0,
+      timestamp: "2026-08-20T12:00:00.000Z",
+      type: "run_start",
+      severity: "info",
+      summary: "start",
+      truncated: false
+    });
+    eventStore.appendEvent({
+      runId: "run-1",
+      seq: 0,
+      timestamp: "2026-08-20T12:00:01.000Z",
+      type: "provider_attempt_success",
+      severity: "info",
+      summary: "provider ok",
+      truncated: false
+    });
+    artifacts.add("run-1", {
+      kind: "provider_trace",
+      label: "provider trace",
+      inline: { providerCalls: 1 }
+    });
+
+    const response = await handleApiRequest(new Request("http://127.0.0.1:8787/api/agent-runs/run-1/read-model"), {
+      QUORUMMIND_RUN_STORE_DIR: rootDir
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.summary).toMatchObject({
+      runId: "run-1",
+      status: "completed",
+      eventCount: 2,
+      artifactCount: 1
+    });
+    expect(body.metrics).toMatchObject({
+      providerCallCount: 1,
+      artifactCount: 1
+    });
+    expect(body.timeline.map((item: { type: string }) => item.type)).toEqual(["run_start", "provider_attempt_success"]);
+  });
+
+  it("accepts approval reply decisions through the API", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-api-approval-reply-"));
+    const store = createPermissionApprovalStore({ rootDir });
+    const record = createPermissionApprovalRecord(
+      decideToolPermission({
+        toolName: "quorummind_live_blueprint_provider_trace",
+        node: "live_model_review"
+      }),
+      {
+        runId: "run-1",
+        requestedBy: "supervisor_agent",
+        createdAt: "2026-08-20T12:00:00.000Z"
+      }
+    );
+
+    store.add(record);
+
+    const response = await handleApiRequest(
+      new Request(`http://127.0.0.1:8787/api/agent-runs/run-1/approvals/${encodeURIComponent(record.id)}/reply`, {
+        method: "POST",
+        body: JSON.stringify({
+          reply: "always",
+          message: "本工具后续允许自动执行"
+        })
+      }),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.approval).toMatchObject({
+      id: record.id,
+      status: "approved",
+      scope: "tool",
+      replyMessage: "本工具后续允许自动执行"
+    });
+    expect(store.savedApprovals()).toEqual([
+      expect.objectContaining({
+        id: record.id,
+        scope: "tool"
+      })
+    ]);
   });
 
   it("tests configured provider connectivity with mock live providers", async () => {
@@ -631,6 +854,160 @@ describe("handleApiRequest", () => {
     expect(body).toMatchObject({
       persistence: { mode: "browser_local", configured: false },
       rooms: []
+    });
+  });
+
+  it("persists autonomous agent run status and exposes lightweight resume semantics", async () => {
+    const runStoreDir = mkdtempSync(join(tmpdir(), "quorummind-api-runs-"));
+    const createResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/agent-runs/blueprint", {
+        method: "POST",
+        body: JSON.stringify({
+          question: "帮我设计一个多 Agent 技术选型流程",
+          mode: "fast",
+          locale: "zh",
+          context,
+          blueprintRuntime: { executionMode: "deterministic" }
+        })
+      }),
+      {
+        QUORUMMIND_PROVIDER_MODE: "demo",
+        QUORUMMIND_RUN_STORE_DIR: runStoreDir
+      }
+    );
+    const createBody = await createResponse.json();
+    const runId = createBody.run.runId;
+
+    const detailResponse = await handleApiRequest(new Request(`http://127.0.0.1:8787/api/agent-runs/${runId}`), {
+      QUORUMMIND_RUN_STORE_DIR: runStoreDir
+    });
+    const detailBody = await detailResponse.json();
+    const resumeResponse = await handleApiRequest(
+      new Request(`http://127.0.0.1:8787/api/agent-runs/${runId}/resume`, {
+        method: "POST",
+        body: JSON.stringify({ humanReviewNote: "认可当前方案" })
+      }),
+      {
+        QUORUMMIND_RUN_STORE_DIR: runStoreDir
+      }
+    );
+    const resumeBody = await resumeResponse.json();
+
+    expect(createResponse.status).toBe(200);
+    expect(detailResponse.status).toBe(200);
+    expect(detailBody.run).toMatchObject({
+      runId,
+      kind: "autonomous_blueprint",
+      status: "paused"
+    });
+    expect(detailBody.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ runId, seq: 1, type: "run_start" }),
+        expect.objectContaining({ runId, type: "human_review_pause" })
+      ])
+    );
+    expect(existsSync(join(runStoreDir, "runs", runId, "run-summary.json"))).toBe(true);
+    expect(existsSync(join(runStoreDir, "runs", runId, "run-metrics.json"))).toBe(true);
+    expect(existsSync(join(runStoreDir, "runs", runId, "run-timeline.json"))).toBe(true);
+    expect(resumeResponse.status).toBe(200);
+    expect(resumeBody).toMatchObject({
+      status: "resumed",
+      run: expect.objectContaining({ runId })
+    });
+  });
+
+  it("lists recent autonomous agent runs newest first", async () => {
+    const runStoreDir = mkdtempSync(join(tmpdir(), "quorummind-api-run-list-"));
+
+    for (const question of ["第一个方案", "第二个方案"]) {
+      await handleApiRequest(
+        new Request("http://127.0.0.1:8787/api/agent-runs/blueprint", {
+          method: "POST",
+          body: JSON.stringify({
+            question,
+            mode: "fast",
+            locale: "zh",
+            context,
+            blueprintRuntime: { executionMode: "deterministic" }
+          })
+        }),
+        {
+          QUORUMMIND_PROVIDER_MODE: "demo",
+          QUORUMMIND_RUN_STORE_DIR: runStoreDir
+        }
+      );
+    }
+
+    const listResponse = await handleApiRequest(new Request("http://127.0.0.1:8787/api/agent-runs"), {
+      QUORUMMIND_RUN_STORE_DIR: runStoreDir
+    });
+    const body = await listResponse.json();
+
+    expect(listResponse.status).toBe(200);
+    expect(body.runs).toHaveLength(2);
+    expect(body.runs[0].summary).toContain("第二个方案");
+    expect(body.runs[1].summary).toContain("第一个方案");
+  });
+
+  it("resumes a paused autonomous agent run through its saved thread checkpoint context", async () => {
+    const runStoreDir = mkdtempSync(join(tmpdir(), "quorummind-api-resume-"));
+    const createResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/agent-runs/blueprint", {
+        method: "POST",
+        body: JSON.stringify({
+          question: "我想做一个视觉类游戏，用多 agent 拆解小说文本，工作流和人物字段怎么设计？",
+          mode: "deep",
+          locale: "zh",
+          context,
+          blueprintRuntime: { executionMode: "deterministic" },
+          agentRuntime: {
+            threadId: "resume-thread",
+            maxConsensusRounds: 2
+          }
+        })
+      }),
+      {
+        QUORUMMIND_PROVIDER_MODE: "demo",
+        QUORUMMIND_RUN_STORE_DIR: runStoreDir
+      }
+    );
+    const createBody = await createResponse.json();
+    const runId = createBody.run.runId;
+
+    const pausedResponse = await handleApiRequest(new Request(`http://127.0.0.1:8787/api/agent-runs/${runId}`), {
+      QUORUMMIND_RUN_STORE_DIR: runStoreDir
+    });
+    const pausedBody = await pausedResponse.json();
+    const resumeResponse = await handleApiRequest(
+      new Request(`http://127.0.0.1:8787/api/agent-runs/${runId}/resume`, {
+        method: "POST",
+        body: JSON.stringify({ humanReviewNote: "人工确认 Schema 方向，继续收敛。" })
+      }),
+      {
+        QUORUMMIND_PROVIDER_MODE: "demo",
+        QUORUMMIND_RUN_STORE_DIR: runStoreDir
+      }
+    );
+    const resumeBody = await resumeResponse.json();
+
+    expect(createResponse.status).toBe(200);
+    expect(pausedBody.run).toMatchObject({
+      runId,
+      status: "paused",
+      threadId: "resume-thread",
+      checkpoint: expect.objectContaining({ threadId: "resume-thread" })
+    });
+    expect(pausedBody.events.map((event: { type: string }) => event.type)).toEqual(
+      expect.arrayContaining(["route_intent_start", "planner_complete", "critic_warn", "human_review_pause"])
+    );
+    expect(resumeResponse.status).toBe(200);
+    expect(resumeBody).toMatchObject({
+      status: "resumed",
+      run: expect.objectContaining({
+        runId,
+        checkpoint: expect.objectContaining({ threadId: "resume-thread" }),
+        summary: expect.objectContaining({ humanReviewRequired: false })
+      })
     });
   });
 

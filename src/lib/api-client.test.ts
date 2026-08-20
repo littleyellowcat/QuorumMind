@@ -2,11 +2,19 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DecisionContext } from "./domain";
 import {
   downloadRenderedPdf,
+  getAgentRunStatus,
   listServerDecisionRooms,
   openServerDecisionRoom,
   requestAutonomousBlueprintRun,
   requestBlueprintRoom,
   requestDecisionRoom,
+  getAgentRunReadModel,
+  replyAgentRunApproval,
+  resumeAgentRun,
+  interruptAgentRun,
+  listAgentRuns,
+  listAgentRunEvents,
+  waitAgentRun,
   testProviderConnections
 } from "./api-client";
 import type { ManualProviderAgent } from "./manual-provider";
@@ -226,6 +234,100 @@ describe("requestAutonomousBlueprintRun", () => {
       humanReviewNote: "Reviewer approved the schema direction."
     });
     expect(body.blueprintRuntime).toEqual({ executionMode: "live", maxProviderRounds: 2 });
+  });
+
+  it("reads, lists, and resumes agent runs through lightweight runtime endpoints", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url === "/api/agent-runs") {
+        return new Response(JSON.stringify({ runs: [{ runId: "run-1", status: "paused" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      if (url === "/api/agent-runs/run-1/resume") {
+        return new Response(JSON.stringify({ status: "resumed", run: { runId: "run-1", status: "completed" } }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      if (url === "/api/agent-runs/run-1/events?after=1") {
+        return new Response(JSON.stringify({ events: [{ runId: "run-1", seq: 2, type: "planner_complete" }], nextAfter: 2 }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      if (url === "/api/agent-runs/run-1/interrupt") {
+        return new Response(JSON.stringify({ runId: "run-1", status: "interrupted", reason: "manual stop" }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      if (url === "/api/agent-runs/run-1/wait") {
+        return new Response(JSON.stringify({ runId: "run-1", status: "completed" }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      if (url === "/api/agent-runs/run-1/read-model") {
+        return new Response(
+          JSON.stringify({
+            summary: { runId: "run-1", status: "completed", eventCount: 2 },
+            metrics: { runId: "run-1", providerCallCount: 1 },
+            timeline: [{ type: "run_start" }, { type: "run_complete" }]
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          }
+        );
+      }
+      if (url === "/api/agent-runs/run-1/approvals/approval-1/reply") {
+        return new Response(
+          JSON.stringify({
+            approval: { id: "approval-1", status: "approved", scope: "tool" }
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          }
+        );
+      }
+      return new Response(JSON.stringify({ run: { runId: "run-1", status: "paused" }, events: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    });
+
+    await expect(listAgentRuns(fetchImpl)).resolves.toMatchObject({
+      runs: [expect.objectContaining({ runId: "run-1" })]
+    });
+    await expect(getAgentRunStatus("run-1", fetchImpl)).resolves.toMatchObject({
+      run: expect.objectContaining({ status: "paused" })
+    });
+    await expect(resumeAgentRun("run-1", "继续", fetchImpl)).resolves.toMatchObject({
+      status: "resumed"
+    });
+    await expect(listAgentRunEvents("run-1", { after: 1 }, fetchImpl)).resolves.toMatchObject({
+      nextAfter: 2,
+      events: [expect.objectContaining({ type: "planner_complete" })]
+    });
+    await expect(interruptAgentRun("run-1", "manual stop", fetchImpl)).resolves.toMatchObject({
+      status: "interrupted"
+    });
+    await expect(waitAgentRun("run-1", fetchImpl)).resolves.toMatchObject({
+      status: "completed"
+    });
+    await expect(getAgentRunReadModel("run-1", fetchImpl)).resolves.toMatchObject({
+      summary: expect.objectContaining({ runId: "run-1" }),
+      metrics: expect.objectContaining({ providerCallCount: 1 }),
+      timeline: expect.arrayContaining([expect.objectContaining({ type: "run_start" })])
+    });
+    await expect(replyAgentRunApproval("run-1", "approval-1", { reply: "always" }, fetchImpl)).resolves.toMatchObject({
+      approval: expect.objectContaining({
+        id: "approval-1",
+        scope: "tool"
+      })
+    });
   });
 });
 

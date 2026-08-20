@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import type { DecisionContext } from "../../src/lib/domain";
 import { createManualProviderBundle } from "../../src/lib/manual-provider";
 import { runDecisionRoom } from "../../src/lib/workflow";
+import { buildContextSourceLedger } from "../context-source-ledger";
 import { createSqliteDecisionRepository } from "./sqlite-repository";
 
 const context: DecisionContext = {
@@ -37,6 +38,12 @@ describe("sqlite decision repository", () => {
       locale: "en",
       context
     });
+    const contextLedger = buildContextSourceLedger({
+      question: "Should we use shared tables or schema-per-tenant?",
+      context,
+      providerTrace: [],
+      fallbackReason: "provider_mode_demo"
+    });
 
     repository.saveDecisionRoom({
       id: "room-1",
@@ -49,6 +56,7 @@ describe("sqlite decision repository", () => {
       quorumScore: result.verdict.quorumScore,
       dissentIndex: result.verdict.dissentIndex,
       providerTrace: [],
+      contextLedger,
       liveVerdict: null,
       promptBundle,
       result,
@@ -71,6 +79,7 @@ describe("sqlite decision repository", () => {
       }
     ]);
     expect(repository.findDecisionRoom("room-1")?.result.roomId).toBe(result.roomId);
+    expect(repository.findDecisionRoom("room-1")?.contextLedger?.contextHash).toBe(contextLedger.contextHash);
     expect(repository.findDecisionRoom("missing")).toBeUndefined();
 
     repository.close();

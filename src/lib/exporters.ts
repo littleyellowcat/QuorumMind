@@ -15,6 +15,8 @@ type JsonTraceExportInput = Pick<
 > & {
   question: string;
   locale?: ADRLocale;
+  providerStatus?: DecisionApiResponse["providerStatus"];
+  contextLedger?: DecisionApiResponse["contextLedger"];
 };
 
 export type PdfReportInput = JsonTraceExportInput;
@@ -23,7 +25,9 @@ export type BlueprintReportInput = {
   question: string;
   locale?: ADRLocale;
   providerMode: "demo" | "live";
+  providerStatus?: DecisionApiResponse["providerStatus"];
   providerTrace: DecisionApiResponse["providerTrace"];
+  contextLedger?: DecisionApiResponse["contextLedger"];
   result: BlueprintRoomResult;
 };
 
@@ -57,7 +61,9 @@ export function createJsonTraceExport(input: JsonTraceExportInput): ExportArtifa
         question: input.question,
         locale: input.locale ?? "en",
         providerMode: input.providerMode,
+        providerStatus: input.providerStatus,
         providerTrace: input.providerTrace,
+        contextLedger: input.contextLedger,
         liveVerdict: input.liveVerdict,
         promptBundle: input.promptBundle,
         result: input.result
@@ -304,6 +310,8 @@ export function createPdfReportHtml(input: PdfReportInput): string {
       </div>
     </section>
 
+    ${sourceTransparencySection(input, labels, locale)}
+
     <section>
       <h2>${labels.adr}</h2>
       <pre>${escapeHtml(generateADR(input.result.verdict.adr, locale))}</pre>
@@ -396,6 +404,7 @@ export function createBlueprintReportHtml(input: BlueprintReportInput): string {
   const zh = locale === "zh";
   const spec = input.result.finalSpec;
   const labels = blueprintReportLabels[locale];
+  const auditLabels = reportLabels[locale];
   const exportedAt = new Date().toLocaleString(zh ? "zh-CN" : "en-US");
   const usableCalls = input.providerTrace.filter(
     (entry) => entry.status === "ok" && entry.jsonParsed && (entry.validationStatus === "valid" || entry.validationStatus === "repaired")
@@ -469,6 +478,8 @@ export function createBlueprintReportHtml(input: BlueprintReportInput): string {
         ${metricHtml(labels.consensusThreshold, `${input.result.consensusThreshold}%`)}
       </div>
     </section>
+
+    ${sourceTransparencySection(input, auditLabels, locale)}
 
     <section>
       <h2>${labels.consensusConvergence}</h2>
@@ -839,6 +850,59 @@ function metricHtml(label: string, value: string): string {
   return `<article class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></article>`;
 }
 
+function sourceTransparencySection(
+  input: {
+    providerStatus?: DecisionApiResponse["providerStatus"];
+    contextLedger?: DecisionApiResponse["contextLedger"];
+  },
+  labels: (typeof reportLabels)[ADRLocale],
+  locale: ADRLocale
+): string {
+  const ledger = input.contextLedger;
+
+  return `<section>
+      <h2>${escapeHtml(labels.sourceTransparency)}</h2>
+      <div class="trace-grid">
+        ${metricHtml(labels.contextHash, ledger ? ledger.contextHash.slice(0, 12) : labels.notRecorded)}
+        ${metricHtml(labels.fallback, ledger ? fallbackSummary(ledger.fallback.used, ledger.fallback.reason, labels) : labels.notRecorded)}
+        ${metricHtml(labels.providerPolicy, providerPolicySummary(input.providerStatus, labels, locale))}
+      </div>
+      ${
+        ledger
+          ? `<p>${escapeHtml(labels.sourceEvidence)}: ${escapeHtml(labels.reputation)} ${
+              ledger.sourceCounts.reputation_feedback
+            } · ${escapeHtml(labels.providerTrace)} ${ledger.sourceCounts.provider_trace} · ${escapeHtml(labels.context)} ${
+              ledger.sourceCounts.user_input + ledger.sourceCounts.structured_context + ledger.sourceCounts.knowledge_injection
+            }</p>`
+          : `<p>${escapeHtml(labels.noContextLedger)}</p>`
+      }
+    </section>`;
+}
+
+function fallbackSummary(used: boolean, reason: string, labels: (typeof reportLabels)[ADRLocale]): string {
+  return used ? `${labels.used} · ${reason}` : `${labels.notUsed} · ${reason}`;
+}
+
+function providerPolicySummary(
+  providerStatus: DecisionApiResponse["providerStatus"] | undefined,
+  labels: (typeof reportLabels)[ADRLocale],
+  locale: ADRLocale
+): string {
+  const providers = Object.values(providerStatus ?? {}).filter((provider) => provider.implemented);
+
+  if (providers.length === 0) {
+    return labels.notRecorded;
+  }
+
+  const configured = providers.filter((provider) => provider.configured).length;
+  const allowed = providers.filter((provider) => provider.configured && provider.policy?.effect !== "deny").length;
+  const denied = providers.filter((provider) => provider.configured && provider.policy?.effect === "deny").length;
+
+  return locale === "zh"
+    ? `${configured} 已配置 / ${allowed} 允许 / ${denied} 拒绝`
+    : `${configured} configured / ${allowed} allowed / ${denied} denied`;
+}
+
 function sectionList(title: string, items: string[]): string {
   return `<section>
       <h2>${escapeHtml(title)}</h2>
@@ -1101,8 +1165,19 @@ const reportLabels = {
     action: "Action",
     traceSummary: "Run trace summary",
     providerCalls: "Provider calls",
+    providerTrace: "provider",
     failures: "Failures",
     jsonParse: "JSON parse",
+    sourceTransparency: "Source transparency",
+    contextHash: "Context hash",
+    fallback: "Fallback",
+    providerPolicy: "Provider policy",
+    sourceEvidence: "Source evidence",
+    context: "context",
+    used: "used",
+    notUsed: "not used",
+    notRecorded: "Not recorded",
+    noContextLedger: "No context ledger was attached to this export.",
     adr: "Architecture Decision Record",
     exportedAt: "Exported",
     footer: "Use JSON trace export for audit-level raw model evidence."
@@ -1151,8 +1226,19 @@ const reportLabels = {
     action: "动作",
     traceSummary: "运行轨迹摘要",
     providerCalls: "模型调用数",
+    providerTrace: "provider",
     failures: "失败数",
     jsonParse: "JSON 解析率",
+    sourceTransparency: "来源透明度",
+    contextHash: "Context hash",
+    fallback: "兜底",
+    providerPolicy: "Provider policy",
+    sourceEvidence: "来源证据",
+    context: "context",
+    used: "已使用",
+    notUsed: "未使用",
+    notRecorded: "未记录",
+    noContextLedger: "本次导出没有附带 context ledger。",
     adr: "架构决策记录",
     exportedAt: "导出时间",
     footer: "审计级原始模型证据请使用 JSON 轨迹导出。"

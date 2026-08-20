@@ -82,4 +82,37 @@ describe("provider registry", () => {
 
     expect(providers.map((provider) => `${provider.id}:${provider.model}`)).toEqual(["gemini:gemini-2.0-flash-lite"]);
   });
+
+  it("filters configured providers through ordered provider policy statements", () => {
+    const providers = createConfiguredProviders({
+      OPENAI_API_KEY: "openai-key",
+      OPENAI_MODEL: "gpt-4o-mini",
+      DEEPSEEK_API_KEY: "deepseek-key",
+      DEEPSEEK_MODEL: "deepseek-chat",
+      GEMINI_API_KEY: "gemini-key",
+      GEMINI_MODEL: "gemini-2.0-flash-lite",
+      QUORUMMIND_PROVIDER_POLICY: JSON.stringify([
+        { effect: "deny", action: "provider.use", resource: "*" },
+        { effect: "allow", action: "provider.use", resource: "deepseek" }
+      ])
+    });
+
+    expect(providers.map((provider) => `${provider.id}:${provider.model}`)).toEqual(["deepseek:deepseek-chat"]);
+    expect(
+      getProviderStatus({
+        OPENAI_API_KEY: "openai-key",
+        DEEPSEEK_API_KEY: "deepseek-key",
+        GEMINI_API_KEY: "gemini-key",
+        QUORUMMIND_PROVIDER_POLICY: JSON.stringify([
+          { effect: "deny", action: "provider.use", resource: "*" },
+          { effect: "allow", action: "provider.use", resource: "deepseek" }
+        ])
+      }).openai
+    ).toMatchObject({
+      configured: true,
+      policy: {
+        effect: "deny"
+      }
+    });
+  });
 });

@@ -12,6 +12,7 @@ export type DecisionHistoryRecord = {
   recommendation: string;
   quorumScore: number;
   providerTrace?: DecisionApiResponse["providerTrace"];
+  contextLedger?: DecisionApiResponse["contextLedger"];
   liveVerdict?: DecisionApiResponse["liveVerdict"];
   promptBundle?: ManualProviderBundle;
   result?: DecisionRoomResult;

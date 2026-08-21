@@ -34,7 +34,7 @@ It turns architecture trade-offs and open-ended technical requirements into a st
 - Scoring explanation drilldown showing why the winner won, score formula contributions, and model ranking evidence.
 - Run profiles for fast smoke tests, full deep review, and adversarial red-team review.
 - Run telemetry for provider calls, failures, JSON parse rate, and total model latency.
-- Configurable GPT, DeepSeek, and Gemini agent seats with editable role, weight, and scoring focus.
+- Configurable model seats with editable role, weight, scoring focus, and model-derived live agent names.
 - Model Reputation v0 that infers the decision domain and converts each model seat's reputation into an explainable effective weight.
 - User feedback loop that saves helpful/needs-work ratings and calibrates future Model Reputation weights.
 - Manual Provider prompt bundles for ChatGPT/Gemini web workflows when API keys are not available.
@@ -165,6 +165,20 @@ OPENAI_API_KEY=...
 DEEPSEEK_API_KEY=...
 GEMINI_API_KEY=...
 ```
+
+If one OpenAI-compatible gateway key can call several model families, prefer the unified gateway path:
+
+```bash
+QUORUMMIND_PROVIDER_MODE=live
+MODEL_GATEWAY_API_KEY=...
+MODEL_GATEWAY_BASE_URL=https://ai.farmmx.com/v1
+MODEL_GATEWAY_GPT_MODEL=gpt-5.5
+MODEL_GATEWAY_DEEPSEEK_MODEL=deepseek-v4-pro
+MODEL_GATEWAY_ANTHROPIC_MODEL=claude-sonnet-4-6
+QUORUMMIND_PROVIDER_TEST_TIMEOUT_MS=300000
+```
+
+The live agent names are derived from the configured model ids unless you explicitly customize a seat name. For example, the configuration above appears in provider traces and prompt bundles as `GPT 5.5 Product Architect`, `DeepSeek V4 Pro Cost/Risk Critic`, and `Claude Sonnet 4.6 Safety Reviewer`. Marketplace ids such as `anthropic/claude-sonnet-4-6` are displayed using the model part, not the namespace.
 
 The browser never receives these keys. The React app calls `/api/decisions`, Vite proxies that request to the local API server, and the server decides whether to use demo fallback or configured providers.
 
@@ -415,20 +429,16 @@ QUORUMMIND_DISABLED_LIVE_MODELS=gemini:gemini-3.1-pro-preview npm run quality:bl
 
 ## Configurable Agent Seats
 
-The Decision Setup panel includes three editable model seats:
-
-- GPT seat
-- DeepSeek seat
-- Gemini seat
+The Decision Setup panel includes three editable model seats. In demo/manual mode they start with GPT, DeepSeek, and Gemini defaults. In live mode, QuorumMind resolves the visible seat name from the configured provider model before the trace and prompt bundle are generated.
 
 For each seat, you can tune:
 
-- agent name
+- agent name, with live-mode dynamic defaults from the configured model id
 - decision role
 - vote weight
 - scoring focus
 
-The selected agent configuration is sent to `/api/decisions`, included in the manual prompt bundle, and passed into live provider prompts. This makes it possible to run the same architecture question with different councils, for example product-heavy review, cost-risk review, or red-team security review.
+Explicit custom names still win over dynamic defaults. If you leave the default names unchanged, switching `MODEL_GATEWAY_GPT_MODEL`, `MODEL_GATEWAY_DEEPSEEK_MODEL`, `MODEL_GATEWAY_GEMINI_MODEL`, `MODEL_GATEWAY_ANTHROPIC_MODEL`, or `MODEL_GATEWAY_MODELS` is enough for provider traces and prompt bundles to follow the new models. The selected agent configuration is sent to `/api/decisions`, included in the manual prompt bundle, and passed into live provider prompts. This makes it possible to run the same architecture question with different councils, for example product-heavy review, cost-risk review, safety review, or red-team security review.
 
 ## Model Reputation
 
@@ -472,7 +482,7 @@ Workflow:
 3. Paste the relevant prompts into ChatGPT, Gemini, or another model UI.
 4. Keep the JSON outputs as a manual trace for later aggregation.
 
-The bundle includes the currently configured GPT, DeepSeek, and Gemini seats across proposal, critique, revision, ranking, and final verdict phases.
+The bundle includes the currently resolved model seats across proposal, critique, revision, ranking, and final verdict phases.
 
 The Decision Room also includes a Prompt Inspector. It groups the generated prompt bundle by phase, shows the exact prompt for each model seat, and lets you copy a single agent/phase prompt when you want to debug or demonstrate the manual workflow without copying the full bundle.
 
@@ -530,7 +540,7 @@ QuorumMind evaluates the trade-off and generates a final ADR recommending shared
 
 The UI can switch between English and Chinese from the top-right language control.
 
-The current MVP localizes interface labels, module headings, agent role names, risk categories, action buttons, context chips, and run-profile labels. The deterministic demo report body is still generated in English. Live provider prompts receive the selected locale so GPT, DeepSeek, Gemini, or a unified model gateway can produce model outputs in the chosen language.
+The current MVP localizes interface labels, module headings, agent role names, risk categories, action buttons, context chips, and run-profile labels. The deterministic demo report body is still generated in English. Live provider prompts receive the selected locale so configured direct providers or unified gateway seats can produce model outputs in the chosen language.
 
 ## Resume Bullet
 

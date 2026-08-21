@@ -4,7 +4,7 @@ QuorumMind is an auditable multi-model decision room for architecture reviews, A
 
 It turns architecture trade-offs and open-ended technical requirements into a structured Decision Room: expert agents generate independent proposals, critique each other, revise their recommendations, compute consensus scores, preserve the disagreement trail, and export an Architecture Decision Record (ADR) or Blueprint.
 
-## What This MVP Demonstrates
+## Core Capabilities
 
 - Decision Room workflow for technical architecture choices.
 - Deterministic expert agents: Principal Architect, SRE Reviewer, Security Reviewer, Cost Engineer, and Pragmatic Builder.
@@ -24,8 +24,8 @@ It turns architecture trade-offs and open-ended technical requirements into a st
 - Provider Capability Router for task-specific model-seat selection, local-only/low-cost routing, and model-dependent capability warnings.
 - Team workspace foundation for member roles, ADR approval workflow, access checks, and a Postgres persistence contract that does not expose connection strings or require a database driver in local-first mode.
 - Live provider trace for proposal, critique, revision, ranking, and verdict phases.
-- Delphi Consensus Protocol log for proposal, blind review, cross-examination, revision, consensus, and final verdict rounds.
-- Blind Review critique payloads that anonymize proposal authors as Proposal A/B/C before cross-examination.
+- Delphi Consensus Protocol log for proposal, blind review, cross-review, revision, consensus, and final verdict rounds.
+- Blind Review critique payloads that anonymize proposal authors as Proposal A/B/C before cross-review.
 - Expandable phase-grouped trace detail with raw model output and provider errors.
 - Safe provider JSON extraction for fenced JSON blocks and narrated model responses.
 - Phase-specific provider schema hardening with validation status, bounded repair, normalized payloads, and failure classification.
@@ -45,11 +45,11 @@ It turns architecture trade-offs and open-ended technical requirements into a st
 - Decision Repository boundary around browser persistence, ready for SQLite/Postgres replacement.
 - Optional server-side SQLite persistence for Decision Room snapshots and reputation feedback.
 - Restorable Decision Room snapshots from browser history.
-- Deterministic mock live providers for CI and demos without API keys.
+- Deterministic mock live providers for CI and local verification without API keys.
 - Docker and GitHub Actions setup for reproducible verification.
 - A polished technical command-center UI that runs without API keys.
 - Code-split export/report generation and deterministic Blueprint fallback so initial UI load does not carry those heavier paths.
-- English and Chinese interface switching for product demos.
+- English and Chinese interface switching.
 
 ## Engineering Docs
 
@@ -58,8 +58,7 @@ It turns architecture trade-offs and open-ended technical requirements into a st
 - [API Contract](./API_CONTRACT.md)
 - [Persistence Strategy](./PERSISTENCE.md)
 - [Security And Privacy](./SECURITY_PRIVACY.md)
-- [Demo Guide](./DEMO.md)
-- [Portfolio Brief](./PORTFOLIO.md)
+- [Local Walkthrough](./DEMO.md)
 
 ## Local-Only Environment
 
@@ -90,13 +89,13 @@ npm run server
 npm run dev:web
 ```
 
-Keyless live-like demo:
+Local mock live mode:
 
 ```bash
 QUORUMMIND_PROVIDER_MODE=live QUORUMMIND_MOCK_PROVIDERS=1 npm run dev
 ```
 
-Docker demo:
+Docker setup:
 
 ```bash
 docker compose up --build
@@ -138,7 +137,7 @@ In the browser, switch **Workspace mode** to **Blueprint**, then use **Agent run
 - `Max provider phases`: caps live Blueprint phases from 1 to 5 across proposal, critique, revision, ranking, and verdict. The setup panel estimates provider calls, rough tokens, and timeout window before a run.
 - `Checkpoint thread`: stable LangGraph `MemorySaver` thread id for repeated runs.
 - `Max discussion rounds`: caps consensus-loop cost and time. If the graph is still below the 80% threshold when this budget is exhausted, it routes to `human_review_gate`.
-- `Human review note`: optional resume evidence for the same checkpoint thread when the graph reaches `human_review_gate`.
+- `Human review note`: optional follow-up evidence for the same checkpoint thread when the graph reaches `human_review_gate`.
 - **Run Agent platform**: calls `POST /api/agent-runs/blueprint` and shows checkpointing, runtime limits, Planner task tree, granular tool permission policy, Executor actions, Critic reviews, long-memory events, Supervisor decisions, consensus loop, route decisions, termination reason, tool calls, and node trace above the normal Blueprint result.
 
 The Agent runtime settings are stored locally in the browser, so refreshing the page keeps the last thread id and discussion-round budget. The Agent platform panel also includes a compact route map before the detailed route list, making it easier to see when the graph continued discussion, finalized, or entered human review.
@@ -149,7 +148,7 @@ Source transparency: when **Live model deep Blueprint** is selected and live pro
 
 ## Provider Modes
 
-The server default mode is deterministic demo mode. It does not call external APIs.
+The server default mode is deterministic local mode. It does not call external APIs.
 
 ```bash
 QUORUMMIND_PROVIDER_MODE=demo
@@ -180,7 +179,7 @@ QUORUMMIND_PROVIDER_TEST_TIMEOUT_MS=300000
 
 The live agent names are derived from the configured model ids unless you explicitly customize a seat name. For example, the configuration above appears in provider traces and prompt bundles as `GPT 5.5 Product Architect`, `DeepSeek V4 Pro Cost/Risk Critic`, and `Claude Sonnet 4.6 Safety Reviewer`. Marketplace ids such as `anthropic/claude-sonnet-4-6` are displayed using the model part, not the namespace.
 
-The browser never receives these keys. The React app calls `/api/decisions`, Vite proxies that request to the local API server, and the server decides whether to use demo fallback or configured providers.
+The browser never receives these keys. The React app calls `/api/decisions`, Vite proxies that request to the local API server, and the server decides whether to use deterministic fallback or configured providers.
 
 Provider slots are centralized in `server/providers/registry.ts`, with capability labels in `server/providers/capabilities.ts`.
 
@@ -301,7 +300,7 @@ Provider traces now include `runId`, attempt count, max attempts, retry count, v
 
 Blueprint live mode deliberately upgrades a Fast UI run to a deep Blueprint trace for synthesis, then applies the configured `maxProviderRounds` cap. With three provider seats and the default five phases, this produces 15 trace entries instead of the 9-call Decision Room Fast profile. The right inspector groups those calls by phase and lists provider, model, duration, and schema status.
 
-For CI and portfolio demos, set `QUORUMMIND_MOCK_PROVIDERS=1` with live mode. QuorumMind will use deterministic local provider seats for GPT, DeepSeek, and Gemini, exercising the same trace, schema, retry, and aggregation surfaces without external network calls.
+For CI and local verification, set `QUORUMMIND_MOCK_PROVIDERS=1` with live mode. QuorumMind will use deterministic local provider seats for GPT, DeepSeek, and Gemini, exercising the same trace, schema, retry, and aggregation surfaces without external network calls.
 
 ## Run Profiles And Telemetry
 
@@ -364,7 +363,7 @@ Targeted live rerun:
 QUORUMMIND_LIVE_AUDIT_CASE_IDS=tenant-zh-fast,agent-framework-zh-red-team npm run quality:live:full
 ```
 
-Long live audits are incremental. They print case start/result/trace lines to the terminal, write every completed case to `output/audit-progress/*.jsonl`, and can resume after interruption:
+Long live audits are incremental. They print case start/result/trace lines to the terminal, write every completed case to `output/audit-progress/*.jsonl`, and can continue after interruption:
 
 ```bash
 QUORUMMIND_LIVE_AUDIT_CASE_IDS=services-zh-red-team,agent-framework-zh-red-team \
@@ -418,7 +417,7 @@ QUORUMMIND_PROVIDER_DEEP_TEST_TIMEOUT_MS=90000 npm run quality:providers:deep
 
 This writes `docs/quality/2026-06-25-provider-deep-connectivity-audit.md` and `output/provider-connectivity/2026-06-25-provider-deep-connectivity-audit.json`. It sends a minimal QuorumMind JSON-schema prompt to each configured live model seat, so it is the fastest way to separate "API/model/key can return structured JSON" from "long Blueprint prompt or phase-specific reasoning is unstable".
 
-If one live seat repeatedly causes `provider_error`, `unparsed`, or invalid schema in the longer Blueprint audit, exclude it temporarily before a demo:
+If one live seat repeatedly causes `provider_error`, `unparsed`, or invalid schema in the longer Blueprint audit, exclude it temporarily before a live run:
 
 ```bash
 QUORUMMIND_DISABLED_LIVE_MODELS=gpt-5.4-mini npm run quality:blueprint:live
@@ -429,7 +428,7 @@ QUORUMMIND_DISABLED_LIVE_MODELS=gemini:gemini-3.1-pro-preview npm run quality:bl
 
 ## Configurable Agent Seats
 
-The Decision Setup panel includes three editable model seats. In demo/manual mode they start with GPT, DeepSeek, and Gemini defaults. In live mode, QuorumMind resolves the visible seat name from the configured provider model before the trace and prompt bundle are generated.
+The Decision Setup panel includes three editable model seats. In deterministic/manual mode they start with GPT, DeepSeek, and Gemini defaults. In live mode, QuorumMind resolves the visible seat name from the configured provider model before the trace and prompt bundle are generated.
 
 For each seat, you can tune:
 
@@ -446,17 +445,17 @@ QuorumMind applies an explainable Model Reputation layer before live calls, manu
 
 Current v0 behavior:
 
-- Infers the decision domain from the question and context: technical architecture, product strategy, career strategy, or portfolio packaging.
+- Infers the decision domain from the question and context: technical architecture, product strategy, career strategy, or documentation positioning.
 - Looks up a domain-specific reputation score for each model seat.
 - Converts the configured base weight into an effective weight using a transparent multiplier.
 - Shows reputation score, inferred domain, rationale, and effective weight in the Agent lineup.
 - Includes the same reputation metadata in generated provider prompts so models know their expected review posture.
 
-The baseline matrix is intentionally simple and auditable for the MVP. User ratings are stored as bounded historical signals under `quorummind.reputation-feedback.v1`, passed into `/api/decisions` on later runs, and used to nudge model-domain scores up or down while preserving transparent base reasons and clamped weights.
+The baseline matrix is intentionally simple and auditable for the current release. User ratings are stored as bounded historical signals under `quorummind.reputation-feedback.v1`, passed into `/api/decisions` on later runs, and used to nudge model-domain scores up or down while preserving transparent base reasons and clamped weights.
 
 ## Decision Mechanisms
 
-The MVP implements the main resume-grade mechanisms as inspectable product surfaces:
+QuorumMind implements the main decision mechanisms as inspectable product surfaces:
 
 - **Decision Score** combines weighted utility, Borda ranking agreement, confidence, and regret penalty. It is the Decision Room's aggregate winner score, not the Blueprint Room's 80% consensus gate.
 - **Delphi Consensus Protocol** records the multi-round expert loop from independent proposal to final verdict.
@@ -518,8 +517,8 @@ npm run build
 - [ARCHITECTURE.md](ARCHITECTURE.md): system boundaries, live provider flow, reliability model, and extension points.
 - [DECISION_ENGINE.md](DECISION_ENGINE.md): Delphi loop, scoring mechanisms, sensitivity analysis, and fallback behavior.
 - [API_CONTRACT.md](API_CONTRACT.md): local API shape, trace metadata, provider output contract, and error classes.
-- [SECURITY_PRIVACY.md](SECURITY_PRIVACY.md): key handling, provider data, local persistence, and demo safety.
-- [DEMO.md](DEMO.md): interview walkthrough, Docker demo, mock E2E, and resume bullets.
+- [SECURITY_PRIVACY.md](SECURITY_PRIVACY.md): key handling, provider data, local persistence, and local runtime safety.
+- [DEMO.md](DEMO.md): local walkthrough, Docker setup, and mock E2E flow.
 
 API smoke test:
 
@@ -528,11 +527,11 @@ npm run server
 curl -s http://127.0.0.1:8787/api/health
 ```
 
-## Demo Scenario
+## Example Scenario
 
 Default question:
 
-> Should a B2B SaaS MVP use schema-per-tenant or shared tables with tenant_id in PostgreSQL?
+> Should a B2B SaaS product use schema-per-tenant or shared tables with tenant_id in PostgreSQL?
 
 QuorumMind evaluates the trade-off and generates a final ADR recommending shared-table tenancy with explicit tenant-boundary tests, per-tenant metrics, and a documented upgrade path to stronger isolation.
 
@@ -540,11 +539,7 @@ QuorumMind evaluates the trade-off and generates a final ADR recommending shared
 
 The UI can switch between English and Chinese from the top-right language control.
 
-The current MVP localizes interface labels, module headings, agent role names, risk categories, action buttons, context chips, and run-profile labels. The deterministic demo report body is still generated in English. Live provider prompts receive the selected locale so configured direct providers or unified gateway seats can produce model outputs in the chosen language.
-
-## Resume Bullet
-
-Built **QuorumMind**, an adversarial multi-agent architecture decision engine that simulates architect, SRE, security, cost, and pragmatic-builder reviewers to evaluate technical trade-offs, compute consensus scores, identify risks, and generate Architecture Decision Records.
+The current release localizes interface labels, module headings, agent role names, risk categories, action buttons, context chips, and run-profile labels. The deterministic local report body is still generated in English. Live provider prompts receive the selected locale so configured direct providers or unified gateway seats can produce model outputs in the chosen language.
 
 ## Future Work
 

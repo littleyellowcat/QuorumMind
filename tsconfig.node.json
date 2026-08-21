@@ -10,6 +10,6 @@
     "strict": true,
     "skipLibCheck": true
   },
-  "include": ["vite.config.ts", "server/**/*.ts", "src/lib/**/*.ts", "src/types/**/*.ts", "src/i18n/**/*.ts"],
-  "exclude": ["server/**/*.test.ts"]
+  "include": ["vite.config.ts", "server/**/*.ts", "scripts/quorummind-cli.ts", "scripts/distribution-doctor.ts", "scripts/github-e2e.ts", "src/lib/**/*.ts", "src/types/**/*.ts", "src/i18n/**/*.ts"],
+  "exclude": ["server/**/*.test.ts", "scripts/**/*.test.ts"]
 }

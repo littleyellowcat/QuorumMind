@@ -91,15 +91,71 @@ export type LiveDecisionTraceRunResult = {
 const fullLivePhases: ProviderPhase[] = ["proposal", "critique", "revision", "ranking", "verdict"];
 const fastLivePhases: ProviderPhase[] = ["proposal", "ranking", "verdict"];
 const providerRoles: AgentRole[] = ["principal_architect", "cost_engineer", "sre_reviewer"];
-const providerAgentIds: Record<ModelProvider["id"], ManualProviderAgent["id"] | undefined> = {
-  model_gateway: undefined,
+const fallbackAgentIds: ManualProviderAgent["id"][] = ["gpt", "deepseek", "gemini"];
+
+type LiveProviderFamily = "openai" | "deepseek" | "gemini" | "anthropic" | "generic";
+
+type LiveProviderAgentProfile = {
+  id: ManualProviderAgent["id"];
+  role: AgentRole;
+  suffix: string;
+  providerLabel: string;
+  scoringFocus: string[];
+};
+
+const providerAgentIds: Partial<Record<ModelProvider["id"], ManualProviderAgent["id"]>> = {
   openai: "gpt",
   deepseek: "deepseek",
   gemini: "gemini"
 };
 
+const providerFamilyProfiles: Record<LiveProviderFamily, LiveProviderAgentProfile> = {
+  openai: {
+    id: "gpt",
+    role: "principal_architect",
+    suffix: "Product Architect",
+    providerLabel: "OpenAI-compatible",
+    scoringFocus: ["product fit", "architecture coherence", "team feasibility"]
+  },
+  deepseek: {
+    id: "deepseek",
+    role: "cost_engineer",
+    suffix: "Cost/Risk Critic",
+    providerLabel: "DeepSeek-compatible",
+    scoringFocus: ["cost efficiency", "implementation complexity", "risk exposure"]
+  },
+  gemini: {
+    id: "gemini",
+    role: "sre_reviewer",
+    suffix: "Strategic Reviewer",
+    providerLabel: "Gemini-compatible",
+    scoringFocus: ["long-term strategy", "reliability", "migration flexibility"]
+  },
+  anthropic: {
+    id: "gemini",
+    role: "sre_reviewer",
+    suffix: "Safety Reviewer",
+    providerLabel: "Anthropic-compatible",
+    scoringFocus: ["safety", "reliability", "migration flexibility"]
+  },
+  generic: {
+    id: "gpt",
+    role: "principal_architect",
+    suffix: "Architecture Reviewer",
+    providerLabel: "OpenAI-compatible",
+    scoringFocus: ["architecture coherence", "risk exposure", "team feasibility"]
+  }
+};
+
 export async function runLiveDecisionTrace(input: RunLiveDecisionTraceInput): Promise<LiveDecisionTraceEntry[]> {
   return (await runLiveDecisionTraceDetailed(input)).trace;
+}
+
+export function createLiveProviderAgents(
+  providers: ModelProvider[],
+  agentConfig?: ManualProviderAgent[]
+): ManualProviderAgent[] {
+  return providers.slice(0, 3).map((provider, index) => agentForProvider(provider, index, agentConfig));
 }
 
 export async function runLiveDecisionTraceDetailed(input: RunLiveDecisionTraceInput): Promise<LiveDecisionTraceRunResult> {
@@ -342,11 +398,194 @@ function agentForProvider(
   provider: ModelProvider,
   index: number,
   agentConfig: ManualProviderAgent[] | undefined
-): ManualProviderAgent | undefined {
+): ManualProviderAgent {
   const agents = agentConfig ?? defaultManualProviderAgents;
+  const configuredAgent = configuredAgentForProvider(provider, index, agents);
+  const dynamicAgent = defaultAgentForProvider(provider, index);
+
+  if (!configuredAgent) {
+    return dynamicAgent;
+  }
+
+  const defaultConfiguredAgent = defaultManualProviderAgents.find((agent) => agent.id === configuredAgent.id);
+  const hasCustomName = !defaultConfiguredAgent || configuredAgent.name !== defaultConfiguredAgent.name;
+  const hasCustomProviderLabel =
+    !defaultConfiguredAgent || configuredAgent.providerLabel !== defaultConfiguredAgent.providerLabel;
+  const hasCustomRole = !defaultConfiguredAgent || configuredAgent.role !== defaultConfiguredAgent.role;
+  const hasCustomScoringFocus =
+    !defaultConfiguredAgent || !sameStrings(configuredAgent.scoringFocus, defaultConfiguredAgent.scoringFocus);
+
+  return {
+    ...dynamicAgent,
+    name: hasCustomName ? configuredAgent.name : dynamicAgent.name,
+    providerLabel: hasCustomProviderLabel ? configuredAgent.providerLabel : dynamicAgent.providerLabel,
+    role: hasCustomRole ? configuredAgent.role : dynamicAgent.role,
+    weight: configuredAgent.weight,
+    baseWeight: configuredAgent.baseWeight,
+    effectiveWeight: configuredAgent.effectiveWeight,
+    reputation: configuredAgent.reputation,
+    scoringFocus: hasCustomScoringFocus ? configuredAgent.scoringFocus : dynamicAgent.scoringFocus
+  };
+}
+
+function configuredAgentForProvider(
+  provider: ModelProvider,
+  index: number,
+  agents: ManualProviderAgent[]
+): ManualProviderAgent | undefined {
   const mappedId = providerAgentIds[provider.id];
 
-  return agents.find((agent) => agent.id === mappedId) ?? agents[index];
+  return (mappedId ? agents.find((agent) => agent.id === mappedId) : undefined) ?? agents[index];
+}
+
+function defaultAgentForProvider(provider: ModelProvider, index: number): ManualProviderAgent {
+  const profile = profileForProvider(provider, index);
+  const modelName = displayNameForModel(provider.model || provider.id);
+
+  return {
+    id: profile.id,
+    name: `${modelName} ${profile.suffix}`,
+    providerLabel: `${profile.providerLabel} / ${modelName}`,
+    role: profile.role,
+    weight: 1,
+    scoringFocus: profile.scoringFocus
+  };
+}
+
+function profileForProvider(provider: ModelProvider, index: number): LiveProviderAgentProfile {
+  const family = familyForProvider(provider);
+
+  if (family !== "generic") {
+    return providerFamilyProfiles[family];
+  }
+
+  return {
+    ...providerFamilyProfiles.generic,
+    id: fallbackAgentIds[index] ?? "gpt",
+    role: providerRoles[index] ?? providerFamilyProfiles.generic.role,
+    providerLabel: providerLabelForProvider(provider.id)
+  };
+}
+
+function familyForProvider(provider: ModelProvider): LiveProviderFamily {
+  const modelTokens = provider.model
+    .toLowerCase()
+    .split(/[^a-z0-9.]+/)
+    .filter(Boolean);
+
+  if (modelTokens.some((token) => token === "claude" || token === "anthropic")) {
+    return "anthropic";
+  }
+
+  if (modelTokens.some((token) => token === "deepseek" || token.startsWith("deepseek"))) {
+    return "deepseek";
+  }
+
+  if (modelTokens.some((token) => token === "gemini" || token.startsWith("gemini"))) {
+    return "gemini";
+  }
+
+  if (modelTokens.some((token) => token === "gpt" || token.startsWith("gpt") || /^o\d/.test(token))) {
+    return "openai";
+  }
+
+  if (provider.id === "anthropic") {
+    return "anthropic";
+  }
+
+  if (provider.id === "deepseek") {
+    return "deepseek";
+  }
+
+  if (provider.id === "gemini") {
+    return "gemini";
+  }
+
+  if (provider.id === "openai") {
+    return "openai";
+  }
+
+  return "generic";
+}
+
+function displayNameForModel(model: string): string {
+  const modelName = model.trim().split("/").filter(Boolean).at(-1) ?? model;
+  const tokens = modelName
+    .replace(/^models\//i, "")
+    .split(/[^a-zA-Z0-9.]+/)
+    .filter(Boolean);
+  const mergedTokens: string[] = [];
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const current = tokens[index];
+    const next = tokens[index + 1];
+
+    if (/^\d+$/.test(current) && next && /^\d+$/.test(next) && current.length <= 2 && next.length <= 2) {
+      mergedTokens.push(`${current}.${next}`);
+      index += 1;
+      continue;
+    }
+
+    mergedTokens.push(current);
+  }
+
+  return mergedTokens.map(formatModelToken).join(" ") || "Model";
+}
+
+function formatModelToken(token: string): string {
+  const lower = token.toLowerCase();
+  const exactNames: Record<string, string> = {
+    ai: "AI",
+    api: "API",
+    gpt: "GPT",
+    lm: "LM",
+    llm: "LLM",
+    openai: "OpenAI",
+    deepseek: "DeepSeek",
+    gemini: "Gemini",
+    claude: "Claude",
+    qwen: "Qwen",
+    kimi: "Kimi",
+    llama: "Llama",
+    lmstudio: "LMStudio"
+  };
+
+  if (exactNames[lower]) {
+    return exactNames[lower];
+  }
+
+  if (lower.startsWith("gpt")) {
+    return `GPT${token.slice(3)}`;
+  }
+
+  if (lower.startsWith("qwen")) {
+    return `Qwen${token.slice(4)}`;
+  }
+
+  if (/^v\d/i.test(token)) {
+    return `V${token.slice(1)}`;
+  }
+
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
+}
+
+function providerLabelForProvider(providerId: ModelProvider["id"]): string {
+  const labels: Record<ModelProvider["id"], string> = {
+    model_gateway: "Model gateway",
+    openai: "OpenAI-compatible",
+    deepseek: "DeepSeek-compatible",
+    gemini: "Gemini-compatible",
+    anthropic: "Anthropic-compatible",
+    openrouter: "OpenRouter",
+    ollama: "Ollama",
+    lmstudio: "LM Studio"
+  };
+
+  return labels[providerId] ?? "Model provider";
+}
+
+function sameStrings(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
 function phasesForMode(mode: DecisionMode | undefined, maxPhases: number | undefined): ProviderPhase[] {

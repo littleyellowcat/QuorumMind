@@ -50,6 +50,22 @@ describe("provider registry", () => {
     expect(providers.map((provider) => provider.id)).toEqual(["openai", "deepseek", "gemini"]);
   });
 
+  it("infers the gateway provider seat from named model families", () => {
+    const providers = createConfiguredProviders({
+      MODEL_GATEWAY_API_KEY: "key",
+      MODEL_GATEWAY_BASE_URL: "https://gateway.example.com/v1",
+      MODEL_GATEWAY_GPT_MODEL: "gpt-5.5",
+      MODEL_GATEWAY_DEEPSEEK_MODEL: "deepseek-v4-pro",
+      MODEL_GATEWAY_GEMINI_MODEL: "claude-sonnet-4-6"
+    });
+
+    expect(providers.map((provider) => `${provider.id}:${provider.model}`)).toEqual([
+      "openai:gpt-5.5",
+      "deepseek:deepseek-v4-pro",
+      "anthropic:claude-sonnet-4-6"
+    ]);
+  });
+
   it("filters disabled gateway model seats without mutating configured model status", () => {
     const providers = createConfiguredProviders({
       MODEL_GATEWAY_API_KEY: "key",

@@ -20,10 +20,11 @@ export type PermissionApprovalReply = {
 };
 
 export type PermissionApprovalStore = {
-  add(record: ToolPermissionApprovalRecord): void;
+  add(record: StoredPermissionApprovalRecord): void;
   list(): StoredPermissionApprovalRecord[];
   approve(id: string, approvedAt?: string): StoredPermissionApprovalRecord | undefined;
   reply(id: string, reply: PermissionApprovalReply): StoredPermissionApprovalRecord | undefined;
+  revoke(id: string, revokedAt?: string): StoredPermissionApprovalRecord | undefined;
   remove(id: string): void;
   savedApprovals(): StoredPermissionApprovalRecord[];
 };
@@ -45,7 +46,7 @@ export function createPermissionApprovalStore(options: PermissionApprovalStoreOp
     writeFileSync(path, `${JSON.stringify(records, null, 2)}\n`, "utf8");
   }
 
-  function add(record: ToolPermissionApprovalRecord): void {
+  function add(record: StoredPermissionApprovalRecord): void {
     const records = list().filter((item) => item.id !== record.id);
     write([...records, record]);
   }
@@ -109,7 +110,26 @@ export function createPermissionApprovalStore(options: PermissionApprovalStoreOp
   }
 
   function savedApprovals(): StoredPermissionApprovalRecord[] {
-    return list().filter((item) => item.status === "approved");
+    const now = new Date().toISOString();
+    return list().filter((item) => item.status === "approved" && !item.revokedAt && !(item.expiresAt && item.expiresAt <= now));
+  }
+
+  function revoke(id: string, revokedAt = new Date().toISOString()): StoredPermissionApprovalRecord | undefined {
+    let updated: StoredPermissionApprovalRecord | undefined;
+    const records = list().map((item) => {
+      if (item.id !== id) {
+        return item;
+      }
+
+      updated = {
+        ...item,
+        revokedAt
+      };
+      return updated;
+    });
+
+    write(records);
+    return updated;
   }
 
   return {
@@ -117,6 +137,7 @@ export function createPermissionApprovalStore(options: PermissionApprovalStoreOp
     list,
     approve,
     reply,
+    revoke,
     remove,
     savedApprovals
   };

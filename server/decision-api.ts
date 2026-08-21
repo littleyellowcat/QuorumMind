@@ -16,20 +16,44 @@ import { GraphInterrupt } from "@langchain/langgraph";
 import { buildContextCompactionEvents, COMPRESSION_THRESHOLD, DEFAULT_MAX_TOKENS, estimateTokenCount } from "./context-compressor";
 import { aggregateLiveVerdict } from "./live-aggregation";
 import { createPermissionApprovalStore, type PermissionApprovalReply } from "./harness/permission-approval-store";
+import { createPermissionAuditReport } from "./harness/permission-audit";
+import { summarizePermissionApprovalLifecycle } from "./harness/permission-lifecycle";
+import { runGithubE2EValidation } from "./github/github-e2e-validation";
+import { planQuorumMindGithubRun } from "./github/quorummind-runner";
 import { createRunArtifactIndex } from "./harness/run-artifact-index";
+import { buildRunAuditReplay, createRunAuditBundle, diffRunAuditReplays, listRunAuditReplays } from "./harness/run-audit-replay";
 import { createRunCoordinator } from "./harness/run-coordinator";
 import { createRunEventStore, defaultHarnessRootDir } from "./harness/run-event-store";
 import type { RunEvent, RunEventType } from "./harness/run-event-trace";
 import { projectRunReadModel } from "./harness/run-read-model";
 import { createRunStatusStore, type RunStatusRecord } from "./harness/run-status-store";
 import { executeGovernedTool } from "./harness/tool-execution-runner";
-import { runLiveDecisionTrace, runLiveDecisionTraceDetailed } from "./live-decision";
+import { executeReadOnlyTool, listConfiguredToolManifests } from "./tools/read-only-tools";
+import { createLiveProviderAgents, runLiveDecisionTrace, runLiveDecisionTraceDetailed } from "./live-decision";
 import { renderHtmlToPdf } from "./pdf-export";
 import { createSqliteDecisionRepository } from "./persistence/sqlite-repository";
 import { testProviderConnections } from "./provider-connectivity";
+import { loadQuorumMindConfig, summarizeQuorumMindConfig } from "./config/quorummind-config";
+import { getProviderCapabilityMatrix } from "./providers/capabilities";
+import { probeProviderCapability } from "./providers/capability-probe";
+import { routeProviderSeatsForEnv } from "./providers/capability-router";
 import { createConfiguredProviders, getProviderStatus, type Env } from "./providers/registry";
+import {
+  createDecisionQualityTrendEntry,
+  createProviderDecisionQualityJudge,
+  defaultDecisionQualityGoldenCases,
+  evaluateDecisionQualityWithOptionalJudge
+} from "./quality/decision-quality-eval";
+import { buildRepoWorkspaceModel } from "./repo/workspace-model";
 import { buildSkillInjection } from "./skill-inject";
 import { matchSkills, type SkillMeta } from "./skill-loader";
+import {
+  createTeamWorkspaceStore,
+  evaluateTeamAccess,
+  summarizePostgresPersistenceContract,
+  type TeamAction,
+  type TeamWorkspace
+} from "./team/team-workspace";
 import {
   apiSecurityPosture,
   applySecurityHeaders,
@@ -111,6 +135,100 @@ const pdfExportPayloadSchema = z.object({
   runId: z.string().min(1).max(180).optional()
 });
 
+const githubRunPayloadSchema = z.object({
+  commentBody: z.string().min(1),
+  repo: z.string().min(1),
+  issueNumber: z.number().int().positive(),
+  diffText: z.string().optional(),
+  changedFiles: z.array(z.string()).default([]),
+  dryRun: z.boolean().optional()
+});
+
+const githubE2EPayloadSchema = githubRunPayloadSchema.extend({
+  write: z.boolean().default(false),
+  headSha: z.string().optional()
+});
+
+const readOnlyToolPayloadSchema = z.object({
+  runId: z.string().min(1),
+  agentId: z.string().min(1),
+  toolName: z.string().min(1),
+  input: z.object({
+    diffText: z.string().optional(),
+    repoRoot: z.string().optional()
+  }).default({})
+});
+
+const providerProbePayloadSchema = z.object({
+  providerId: z.enum(["model_gateway", "openai", "deepseek", "gemini", "anthropic", "openrouter", "ollama", "lmstudio"]).optional(),
+  sampleCount: z.number().int().min(1).max(5).default(3)
+});
+
+const providerRoutePayloadSchema = z.object({
+  task: z.string().min(1).default("architecture_review"),
+  requirements: z.object({
+    jsonSchema: z.boolean().optional(),
+    toolCalls: z.boolean().optional(),
+    longContext: z.boolean().optional(),
+    lowCost: z.boolean().optional(),
+    localOnly: z.boolean().optional(),
+    maxSeats: z.number().int().min(1).max(8).optional()
+  }).default({})
+});
+
+const qualityEvalPayloadSchema = z.object({
+  suiteName: z.string().min(1).default("offline-golden"),
+  outputs: z.record(z.string(), z.union([
+    z.string(),
+    z.object({
+      text: z.string(),
+      providerId: z.string().optional(),
+      model: z.string().optional()
+    })
+  ])).default({}),
+  judge: z.object({
+    enabled: z.boolean().default(false),
+    providerId: z.enum(["model_gateway", "openai", "deepseek", "gemini", "anthropic", "openrouter", "ollama", "lmstudio"]).optional()
+  }).optional()
+});
+
+const workspaceModelPayloadSchema = z.object({
+  selectedFiles: z.array(z.string()).default([]),
+  diffText: z.string().optional(),
+  testOutput: z.string().optional(),
+  ciStatus: z.enum(["passing", "failing", "unknown"]).default("unknown")
+});
+
+const teamWorkspacePayloadSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  persistenceMode: z.enum(["browser_local", "sqlite", "postgres"]).default("browser_local"),
+  members: z.array(z.object({
+    userId: z.string().min(1),
+    role: z.enum(["owner", "reviewer", "viewer"])
+  })).min(1)
+});
+
+const teamAccessPayloadSchema = z.object({
+  workspaceId: z.string().min(1),
+  userId: z.string().min(1),
+  action: z.enum(["view", "comment", "create_adr", "approve_adr", "admin"])
+});
+
+const teamAdrApprovalPayloadSchema = z.object({
+  workspaceId: z.string().min(1),
+  adrId: z.string().min(1),
+  title: z.string().min(1),
+  requestedBy: z.string().min(1),
+  requiredApprovers: z.array(z.string().min(1)).default([])
+});
+
+const teamAdrApprovalReplyPayloadSchema = z.object({
+  userId: z.string().min(1),
+  decision: z.enum(["approve", "request_changes", "reject"]),
+  note: z.string().optional()
+});
+
 export async function handleApiRequest(request: Request, env: Env = process.env): Promise<Response> {
   const corsError = validateCors(request, env);
 
@@ -140,11 +258,14 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
   const url = new URL(request.url);
 
   if (url.pathname === "/api/health" && request.method === "GET") {
+    const config = loadQuorumMindConfig(configRootForEnv(env));
     return json(request, env, {
       status: "ok",
       providerMode: providerModeForEnv(env),
       persistence: persistenceStatusForEnv(env),
-      providerStatus: getProviderStatus(env)
+      providerStatus: getProviderStatus(env),
+      providerCapabilities: getProviderCapabilityMatrix(),
+      configSummary: summarizeQuorumMindConfig(config)
     });
   }
 
@@ -158,6 +279,82 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
       providerStatus: getProviderStatus(env),
       results: await testProviderConnections(env)
     });
+  }
+
+  if (url.pathname === "/api/providers/probe" && request.method === "POST") {
+    return handleProviderProbeRequest(request, env);
+  }
+
+  if (url.pathname === "/api/providers/route" && request.method === "POST") {
+    return handleProviderRouteRequest(request, env);
+  }
+
+  if (url.pathname === "/api/quality/eval" && request.method === "POST") {
+    return handleQualityEvalRequest(request, env);
+  }
+
+  if (url.pathname === "/api/team/workspaces" && request.method === "POST") {
+    return handleTeamWorkspaceRequest(request, env);
+  }
+
+  const teamWorkspaceSubroute = parseTeamWorkspaceSubroute(url.pathname);
+
+  if (teamWorkspaceSubroute && request.method === "GET") {
+    return openTeamWorkspaceRequest(request, env, teamWorkspaceSubroute.workspaceId);
+  }
+
+  if (url.pathname === "/api/team/access" && request.method === "POST") {
+    return handleTeamAccessRequest(request, env);
+  }
+
+  if (url.pathname === "/api/team/adr-approvals" && request.method === "POST") {
+    return handleTeamAdrApprovalRequest(request, env);
+  }
+
+  const teamAdrApprovalSubroute = parseTeamAdrApprovalSubroute(url.pathname);
+
+  if (teamAdrApprovalSubroute?.action === "reply" && request.method === "POST") {
+    return replyTeamAdrApprovalRequest(request, env, teamAdrApprovalSubroute.approvalId);
+  }
+
+  if (url.pathname === "/api/permissions/audit" && request.method === "GET") {
+    return json(request, env, createPermissionAuditReport(createPermissionApprovalStore({ rootDir: runStoreRootForEnv(env) }).list()));
+  }
+
+  if (url.pathname === "/api/permissions/lifecycle" && request.method === "GET") {
+    return json(request, env, summarizePermissionApprovalLifecycle(createPermissionApprovalStore({ rootDir: runStoreRootForEnv(env) }).list()));
+  }
+
+  const permissionApprovalSubroute = parsePermissionApprovalSubroute(url.pathname);
+
+  if (permissionApprovalSubroute?.action === "approval-reply" && request.method === "POST") {
+    return replyPermissionApproval(request, env, permissionApprovalSubroute.approvalId);
+  }
+
+  if (permissionApprovalSubroute?.action === "approval-revoke" && request.method === "POST") {
+    return revokePermissionApproval(request, env, permissionApprovalSubroute.approvalId);
+  }
+
+  if (url.pathname === "/api/tools/manifests" && request.method === "GET") {
+    return json(request, env, {
+      tools: listConfiguredToolManifests(configRootForEnv(env))
+    });
+  }
+
+  if (url.pathname === "/api/tools/read-only" && request.method === "POST") {
+    return handleReadOnlyToolRequest(request, env);
+  }
+
+  if (url.pathname === "/api/github/run" && request.method === "POST") {
+    return handleGithubRunRequest(request, env);
+  }
+
+  if (url.pathname === "/api/github/e2e" && request.method === "POST") {
+    return handleGithubE2ERequest(request, env);
+  }
+
+  if (url.pathname === "/api/repo/workspace" && request.method === "POST") {
+    return handleRepoWorkspaceRequest(request, env);
   }
 
   if (url.pathname === "/api/exports/pdf" && request.method === "POST") {
@@ -185,7 +382,19 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
     return listAgentRuns(request, env);
   }
 
+  if (url.pathname === "/api/agent-runs/audit/diff" && request.method === "GET") {
+    return diffAgentRunAuditReplays(request, env);
+  }
+
+  if (url.pathname === "/api/agent-runs/audit" && request.method === "GET") {
+    return listAgentRunAuditReplays(request, env);
+  }
+
   const agentRunSubroute = parseAgentRunSubroute(url.pathname);
+
+  if (agentRunSubroute?.action === "audit" && request.method === "GET") {
+    return openAgentRunAuditReplay(request, env, agentRunSubroute.runId);
+  }
 
   if (agentRunSubroute?.action === "events" && request.method === "GET") {
     return listAgentRunEvents(request, env, agentRunSubroute.runId);
@@ -245,6 +454,9 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
     question,
     context
   }, reputationFeedback);
+  const liveResolvedAgents = shouldUseLiveProviders
+    ? createLiveProviderAgents(providers, reputationAdjustedAgents)
+    : reputationAdjustedAgents;
   const knowledgeInjection = buildKnowledgeInjection(question, context);
   const result = runDecisionRoom({ question, mode, context, knowledgeInjection });
   const providerRun = shouldUseLiveProviders
@@ -253,7 +465,8 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
         question,
         locale,
         mode,
-        agentConfig: reputationAdjustedAgents,
+        agentConfig: liveResolvedAgents,
+        retryPolicy: liveProviderRetryPolicyForEnv(env),
         runStoreDir: runStoreRootForEnv(env),
         context
       })
@@ -288,7 +501,7 @@ export async function handleApiRequest(request: Request, env: Env = process.env)
   const promptBundle = createManualProviderBundle({
     question: question,
     locale: locale,
-    agents: reputationAdjustedAgents,
+    agents: liveResolvedAgents,
     context: context
   });
   const persistence = persistDecisionRoomIfConfigured(env, {
@@ -350,6 +563,9 @@ async function handleBlueprintRequest(request: Request, env: Env): Promise<Respo
     question,
     context
   }, reputationFeedback);
+  const liveResolvedAgents = shouldUseLiveProviders
+    ? createLiveProviderAgents(providers, reputationAdjustedAgents)
+    : reputationAdjustedAgents;
   const baseResult = runBlueprintRoom({
     question,
     mode,
@@ -364,7 +580,8 @@ async function handleBlueprintRequest(request: Request, env: Env): Promise<Respo
         locale: locale,
         mode: mode === "fast" ? "deep" : mode,
         maxPhases: blueprintRuntime.maxProviderRounds,
-        agentConfig: reputationAdjustedAgents,
+        agentConfig: liveResolvedAgents,
+        retryPolicy: liveProviderRetryPolicyForEnv(env),
         runStoreDir: runStoreRootForEnv(env),
         context: context
       })
@@ -393,7 +610,7 @@ async function handleBlueprintRequest(request: Request, env: Env): Promise<Respo
   const promptBundle = createManualProviderBundle({
     question: blueprintQuestion,
     locale: locale,
-    agents: reputationAdjustedAgents,
+    agents: liveResolvedAgents,
     context: context
   });
 
@@ -474,6 +691,358 @@ async function handlePdfExportRequest(request: Request, env: Env): Promise<Respo
       error: `PDF rendering failed: ${error instanceof Error ? error.message : "Unknown rendering error"}`
     }, 500);
   }
+}
+
+async function handleGithubRunRequest(request: Request, env: Env): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = githubRunPayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid GitHub runner request: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  return json(request, env, await planQuorumMindGithubRun({
+    ...parsed.data,
+    repoRoot: configRootForEnv(env),
+    dryRun: parsed.data.dryRun ?? true,
+    githubToken: env.GITHUB_TOKEN
+  }));
+}
+
+async function handleGithubE2ERequest(request: Request, env: Env): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = githubE2EPayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid GitHub E2E request: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  const write = parsed.data.write === true && env.QUORUMMIND_GITHUB_E2E_WRITE === "1";
+
+  return json(request, env, {
+    report: await runGithubE2EValidation({
+      ...parsed.data,
+      write,
+      token: write ? env.GITHUB_TOKEN : undefined,
+      headSha: parsed.data.headSha ?? env.GITHUB_SHA,
+      repoRoot: configRootForEnv(env)
+    })
+  });
+}
+
+async function handleReadOnlyToolRequest(request: Request, env: Env): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = readOnlyToolPayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid read-only tool request: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  const result = await executeReadOnlyTool({
+    rootDir: configRootForEnv(env),
+    runId: parsed.data.runId,
+    agentId: parsed.data.agentId,
+    toolName: parsed.data.toolName,
+    input: parsed.data.input,
+    approvalStore: createPermissionApprovalStore({ rootDir: runStoreRootForEnv(env) })
+  });
+
+  return json(
+    request,
+    env,
+    result,
+    result.status === "blocked" ? 403 : result.status === "requires_human" ? 409 : 200
+  );
+}
+
+async function handleProviderProbeRequest(request: Request, env: Env): Promise<Response> {
+  if (env.QUORUMMIND_MOCK_PROVIDERS !== "1" && env.QUORUMMIND_PROVIDER_PROBE_ENABLED !== "1") {
+    return json(request, env, {
+      error: "Provider capability probe is disabled unless QUORUMMIND_MOCK_PROVIDERS=1 or QUORUMMIND_PROVIDER_PROBE_ENABLED=1 is set."
+    }, 403);
+  }
+
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = providerProbePayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid provider probe request: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  const providers = createConfiguredProviders(env);
+  const selected = parsed.data.providerId
+    ? providers.filter((provider) => provider.id === parsed.data.providerId)
+    : providers.slice(0, 3);
+
+  if (selected.length === 0) {
+    return json(request, env, { error: "No configured provider matched the probe request." }, 404);
+  }
+
+  const probes = await Promise.all(
+    selected.map((provider) =>
+      probeProviderCapability({
+        provider,
+        sampleCount: parsed.data.sampleCount
+      })
+    )
+  );
+
+  return json(request, env, parsed.data.providerId ? { probe: probes[0] } : { probes });
+}
+
+async function handleProviderRouteRequest(request: Request, env: Env): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = providerRoutePayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid provider route request: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  return json(request, env, {
+    route: routeProviderSeatsForEnv({
+      env,
+      task: parsed.data.task,
+      requirements: parsed.data.requirements
+    })
+  });
+}
+
+async function handleQualityEvalRequest(request: Request, env: Env): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = qualityEvalPayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid quality eval request: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  const judgeEnabled = parsed.data.judge?.enabled === true && env.QUORUMMIND_LLM_JUDGE_ENABLED === "1";
+  const judgeProvider = judgeEnabled
+    ? createConfiguredProviders(env).find((provider) => !parsed.data.judge?.providerId || provider.id === parsed.data.judge.providerId)
+    : undefined;
+  const report = await evaluateDecisionQualityWithOptionalJudge({
+    suiteName: parsed.data.suiteName,
+    cases: defaultDecisionQualityGoldenCases,
+    outputs: parsed.data.outputs,
+    judgeRequested: parsed.data.judge?.enabled === true,
+    judgeSkipReason:
+      parsed.data.judge?.enabled === true
+        ? env.QUORUMMIND_LLM_JUDGE_ENABLED === "1"
+          ? "No configured provider matched the requested judge."
+          : "QUORUMMIND_LLM_JUDGE_ENABLED is not set."
+        : undefined,
+    llmJudge: judgeProvider ? createProviderDecisionQualityJudge(judgeProvider) : undefined
+  });
+
+  return json(request, env, {
+    report,
+    trend: createDecisionQualityTrendEntry(report)
+  });
+}
+
+function openTeamWorkspaceRequest(request: Request, env: Env, workspaceId: string): Response {
+  const store = createTeamWorkspaceStore({ rootDir: teamStoreRootForEnv(env) });
+  const workspace = store.findWorkspace(workspaceId);
+
+  if (!workspace) {
+    return json(request, env, { error: "Team workspace not found." }, 404);
+  }
+
+  return json(request, env, {
+    workspace,
+    approvals: store.listAdrApprovals(workspace.id),
+    persistenceContract: persistenceContractForWorkspace(env, workspace)
+  });
+}
+
+async function handleRepoWorkspaceRequest(request: Request, env: Env): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = workspaceModelPayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid repo workspace request: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  return json(request, env, {
+    workspace: buildRepoWorkspaceModel({
+      repoRoot: configRootForEnv(env),
+      selectedFiles: parsed.data.selectedFiles,
+      diffText: parsed.data.diffText,
+      testOutput: parsed.data.testOutput,
+      ciStatus: parsed.data.ciStatus
+    })
+  });
+}
+
+async function handleTeamWorkspaceRequest(request: Request, env: Env): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = teamWorkspacePayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid team workspace request: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  const workspace = createTeamWorkspaceStore({ rootDir: teamStoreRootForEnv(env) }).saveWorkspace(parsed.data);
+
+  return json(request, env, {
+    workspace,
+    persistenceContract: persistenceContractForWorkspace(env, workspace)
+  });
+}
+
+async function handleTeamAccessRequest(request: Request, env: Env): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = teamAccessPayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid team access request: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  const store = createTeamWorkspaceStore({ rootDir: teamStoreRootForEnv(env) });
+  const workspace = store.findWorkspace(parsed.data.workspaceId);
+
+  if (!workspace) {
+    return json(request, env, { error: "Team workspace not found." }, 404);
+  }
+
+  return json(request, env, {
+    access: evaluateTeamAccess(workspace, parsed.data.userId, parsed.data.action as TeamAction)
+  });
+}
+
+async function handleTeamAdrApprovalRequest(request: Request, env: Env): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = teamAdrApprovalPayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid ADR approval request: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  const store = createTeamWorkspaceStore({ rootDir: teamStoreRootForEnv(env) });
+  const workspace = store.findWorkspace(parsed.data.workspaceId);
+
+  if (!workspace) {
+    return json(request, env, { error: "Team workspace not found." }, 404);
+  }
+
+  return json(request, env, {
+    approval: store.createAdrApproval(parsed.data)
+  });
+}
+
+async function replyTeamAdrApprovalRequest(request: Request, env: Env, approvalId: string): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = teamAdrApprovalReplyPayloadSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    return json(request, env, {
+      error: `Invalid ADR approval reply: ${parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`
+    }, 400);
+  }
+
+  const approval = createTeamWorkspaceStore({ rootDir: teamStoreRootForEnv(env) }).replyAdrApproval(approvalId, parsed.data);
+
+  if (!approval) {
+    return json(request, env, { error: "ADR approval not found." }, 404);
+  }
+
+  return json(request, env, { approval });
 }
 
 async function handleAutonomousBlueprintRequest(request: Request, env: Env): Promise<Response> {
@@ -595,6 +1164,7 @@ async function handleAutonomousBlueprintRequest(request: Request, env: Env): Pro
                       mode: mode === "fast" ? "deep" : mode,
                       maxPhases: blueprintRuntime.maxProviderRounds,
                       agentConfig: reputationAdjustedAgents,
+                      retryPolicy: liveProviderRetryPolicyForEnv(env),
                       runStoreDir: runStoreRoot,
                       context: context
                     })
@@ -735,6 +1305,28 @@ function openAgentRunReadModel(request: Request, env: Env, runId: string): Respo
   return json(request, env, projectRunReadModel({ rootDir, runId }));
 }
 
+function openAgentRunAuditReplay(request: Request, env: Env, runId: string): Response {
+  const rootDir = runStoreRootForEnv(env);
+  const status = createRunStatusStore({ rootDir }).find(runId);
+  const events = createRunEventStore({ rootDir }).listEvents(runId);
+
+  if (!status && events.length === 0) {
+    return json(request, env, { error: "Agent run not found." }, 404);
+  }
+
+  const url = new URL(request.url);
+  const replay = buildRunAuditReplay({ rootDir, runId });
+
+  return json(request, env, url.searchParams.get("bundle") === "true"
+    ? {
+        replay,
+        bundle: createRunAuditBundle({ rootDir, runId })
+      }
+    : {
+        replay
+      });
+}
+
 function listAgentRunEvents(request: Request, env: Env, runId: string): Response {
   const url = new URL(request.url);
   const rootDir = runStoreRootForEnv(env);
@@ -792,6 +1384,42 @@ async function replyAgentRunApproval(request: Request, env: Env, runId: string, 
   return json(request, env, { approval });
 }
 
+async function replyPermissionApproval(request: Request, env: Env, approvalId: string): Promise<Response> {
+  let payload: unknown;
+
+  try {
+    payload = await request.json();
+  } catch {
+    return json(request, env, { error: "Request body must be valid JSON." }, 400);
+  }
+
+  const parsed = parsePermissionApprovalReply(payload);
+
+  if (!parsed) {
+    return json(request, env, { error: "Approval reply must be approve, reject, or always." }, 400);
+  }
+
+  const store = createPermissionApprovalStore({ rootDir: runStoreRootForEnv(env) });
+  const approval = store.reply(approvalId, parsed);
+
+  if (!approval) {
+    return json(request, env, { error: "Permission approval not found." }, 404);
+  }
+
+  return json(request, env, { approval });
+}
+
+function revokePermissionApproval(request: Request, env: Env, approvalId: string): Response {
+  const store = createPermissionApprovalStore({ rootDir: runStoreRootForEnv(env) });
+  const approval = store.revoke(approvalId);
+
+  if (!approval) {
+    return json(request, env, { error: "Permission approval not found." }, 404);
+  }
+
+  return json(request, env, { approval });
+}
+
 function listAgentRuns(request: Request, env: Env): Response {
   const url = new URL(request.url);
   const limit = Number(url.searchParams.get("limit") ?? 20);
@@ -799,6 +1427,44 @@ function listAgentRuns(request: Request, env: Env): Response {
 
   return json(request, env, {
     runs: store.list({ limit: Number.isFinite(limit) ? limit : 20 })
+  });
+}
+
+function listAgentRunAuditReplays(request: Request, env: Env): Response {
+  const url = new URL(request.url);
+  const limit = Number(url.searchParams.get("limit") ?? 20);
+  const prNumber = Number(url.searchParams.get("pr") ?? "");
+
+  return json(request, env, {
+    replays: listRunAuditReplays({
+      rootDir: runStoreRootForEnv(env),
+      limit: Number.isFinite(limit) ? limit : 20,
+      query: url.searchParams.get("query") ?? undefined,
+      status: parseRunStatusFilter(url.searchParams.get("status")),
+      kind: parseRunKindFilter(url.searchParams.get("kind")),
+      provider: url.searchParams.get("provider") ?? undefined,
+      prNumber: Number.isFinite(prNumber) && prNumber > 0 ? prNumber : undefined,
+      adrPath: url.searchParams.get("adr") ?? undefined,
+      riskLevel: url.searchParams.get("risk") ?? undefined
+    })
+  });
+}
+
+function diffAgentRunAuditReplays(request: Request, env: Env): Response {
+  const url = new URL(request.url);
+  const baseRunId = url.searchParams.get("base");
+  const targetRunId = url.searchParams.get("target");
+
+  if (!baseRunId || !targetRunId) {
+    return json(request, env, { error: "Audit diff requires base and target run ids." }, 400);
+  }
+
+  return json(request, env, {
+    diff: diffRunAuditReplays({
+      rootDir: runStoreRootForEnv(env),
+      baseRunId,
+      targetRunId
+    })
   });
 }
 
@@ -941,7 +1607,7 @@ async function waitAgentRun(request: Request, env: Env, runId: string): Promise<
 function parseAgentRunSubroute(pathname: string):
   | {
       runId: string;
-      action: "status" | "events" | "interrupt" | "wait" | "resume" | "read-model";
+      action: "status" | "events" | "interrupt" | "wait" | "resume" | "read-model" | "audit";
     }
   | {
       runId: string;
@@ -956,7 +1622,7 @@ function parseAgentRunSubroute(pathname: string):
 
   const parts = pathname.slice(prefix.length).split("/");
   const runId = decodeURIComponent(parts[0] ?? "");
-  const action = parts[1] as "events" | "interrupt" | "wait" | "resume" | "read-model" | "approvals" | undefined;
+  const action = parts[1] as "events" | "interrupt" | "wait" | "resume" | "read-model" | "audit" | "approvals" | undefined;
 
   if (!runId) {
     return undefined;
@@ -970,11 +1636,82 @@ function parseAgentRunSubroute(pathname: string):
     };
   }
 
-  if (action === "events" || action === "interrupt" || action === "wait" || action === "resume" || action === "read-model") {
+  if (action === "events" || action === "interrupt" || action === "wait" || action === "resume" || action === "read-model" || action === "audit") {
     return { runId, action };
   }
 
   return { runId, action: "status" };
+}
+
+function parsePermissionApprovalSubroute(pathname: string):
+  | {
+      action: "approval-reply";
+      approvalId: string;
+    }
+  | {
+      action: "approval-revoke";
+      approvalId: string;
+    }
+  | undefined {
+  const prefix = "/api/permissions/approvals/";
+
+  if (!pathname.startsWith(prefix)) {
+    return undefined;
+  }
+
+  const parts = pathname.slice(prefix.length).split("/");
+
+  if (!parts[0]) {
+    return undefined;
+  }
+
+  if (parts[1] === "revoke") {
+    return {
+      action: "approval-revoke",
+      approvalId: decodeURIComponent(parts[0])
+    };
+  }
+
+  if (parts[1] !== "reply") {
+    return undefined;
+  }
+
+  return {
+    action: "approval-reply",
+    approvalId: decodeURIComponent(parts[0])
+  };
+}
+
+function parseTeamWorkspaceSubroute(pathname: string): { workspaceId: string } | undefined {
+  const prefix = "/api/team/workspaces/";
+  if (!pathname.startsWith(prefix)) {
+    return undefined;
+  }
+
+  const workspaceId = decodeURIComponent(pathname.slice(prefix.length));
+  return workspaceId ? { workspaceId } : undefined;
+}
+
+function parseTeamAdrApprovalSubroute(pathname: string):
+  | {
+      action: "reply";
+      approvalId: string;
+    }
+  | undefined {
+  const prefix = "/api/team/adr-approvals/";
+  if (!pathname.startsWith(prefix)) {
+    return undefined;
+  }
+
+  const parts = pathname.slice(prefix.length).split("/");
+  if (!parts[0] || parts[1] !== "reply") {
+    return undefined;
+  }
+
+  return {
+    action: "reply",
+    approvalId: decodeURIComponent(parts[0])
+  };
 }
 
 function parsePermissionApprovalReply(value: unknown): PermissionApprovalReply | undefined {
@@ -995,6 +1732,14 @@ function parsePermissionApprovalReply(value: unknown): PermissionApprovalReply |
 
 function runStoreRootForEnv(env: Env): string {
   return env.QUORUMMIND_RUN_STORE_DIR ?? defaultHarnessRootDir();
+}
+
+function teamStoreRootForEnv(env: Env): string {
+  return env.QUORUMMIND_TEAM_STORE_DIR ?? runStoreRootForEnv(env);
+}
+
+function configRootForEnv(env: Env): string {
+  return env.QUORUMMIND_CONFIG_DIR ?? process.cwd();
 }
 
 function createApiRunId(prefix: string): string {
@@ -1204,6 +1949,16 @@ function parseBlueprintRuntimeConfig(value: unknown): BlueprintRuntimeConfig {
   };
 }
 
+function liveProviderRetryPolicyForEnv(env: Env): { maxAttempts: number } | undefined {
+  const configured = Number(env.QUORUMMIND_LIVE_PROVIDER_MAX_ATTEMPTS);
+
+  if (!Number.isInteger(configured)) {
+    return undefined;
+  }
+
+  return { maxAttempts: Math.min(3, Math.max(1, configured)) };
+}
+
 function summarizeBlueprintExecution(input: {
   requested: BlueprintExecutionMode;
   requestedProviderMode: "demo" | "live";
@@ -1301,6 +2056,35 @@ function persistenceStatusForEnv(env: Env) {
         mode: "browser_local" as const,
         configured: false
   };
+}
+
+function persistenceContractForWorkspace(env: Env, workspace: TeamWorkspace) {
+  if (workspace.persistenceMode === "postgres") {
+    return summarizePostgresPersistenceContract({
+      connectionStringPresent: Boolean(env.QUORUMMIND_POSTGRES_URL),
+      schema: env.QUORUMMIND_POSTGRES_SCHEMA ?? "quorummind",
+      sslMode: env.QUORUMMIND_POSTGRES_SSL === "disable"
+        ? "disable"
+        : env.QUORUMMIND_POSTGRES_SSL === "require"
+          ? "require"
+          : "prefer"
+    });
+  }
+
+  return {
+    mode: workspace.persistenceMode,
+    configured: workspace.persistenceMode === "sqlite" ? Boolean(env.QUORUMMIND_SQLITE_PATH) : true
+  };
+}
+
+function parseRunStatusFilter(value: string | null): RunStatusRecord["status"] | undefined {
+  return value === "running" || value === "paused" || value === "completed" || value === "failed" || value === "interrupted"
+    ? value
+    : undefined;
+}
+
+function parseRunKindFilter(value: string | null): RunStatusRecord["kind"] | undefined {
+  return value === "live_decision" || value === "autonomous_blueprint" ? value : undefined;
 }
 
 function listPersistedDecisionRooms(request: Request, env: Env): Response {

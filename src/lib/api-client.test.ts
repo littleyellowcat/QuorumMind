@@ -9,13 +9,16 @@ import {
   requestBlueprintRoom,
   requestDecisionRoom,
   getAgentRunReadModel,
+  getRunAuditReplay,
   replyAgentRunApproval,
+  listRunAuditReplays,
   resumeAgentRun,
   interruptAgentRun,
   listAgentRuns,
   listAgentRunEvents,
   waitAgentRun,
-  testProviderConnections
+  testProviderConnections,
+  diffRunAuditReplays
 } from "./api-client";
 import type { ManualProviderAgent } from "./manual-provider";
 
@@ -135,6 +138,113 @@ describe("requestDecisionRoom", () => {
         fetchImpl
       )
     ).rejects.toThrow("architecture question");
+  });
+});
+
+describe("run audit replay endpoints", () => {
+  it("lists and opens run audit replays through the API", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url === "/api/agent-runs/audit?query=auth&provider=openrouter&pr=42") {
+        return new Response(JSON.stringify({
+          replays: [
+            {
+              runId: "run-1",
+              status: "completed",
+              eventCount: 2,
+              artifactCount: 1,
+              providers: ["openrouter"],
+              linkedPullRequests: [42],
+              linkedAdrPaths: ["docs/ADR-042-auth.md"],
+              riskLevels: ["high"]
+            }
+          ]
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      if (url === "/api/agent-runs/run-1/audit?bundle=true") {
+        return new Response(
+          JSON.stringify({
+            replay: {
+              summary: { runId: "run-1", eventCount: 2, artifactCount: 1 },
+              metrics: { runId: "run-1", providerCallCount: 1, permissionDecisionCount: 1, githubReviewCount: 1 },
+              timeline: [],
+              providerCalls: [],
+              artifacts: [],
+              githubReviews: [],
+              permissionAudit: { generatedAt: "2026-08-21T08:00:00.000Z", summary: { total: 0, allowed: 0, humanGated: 0, blocked: 0, redactedOrTruncated: 0 }, items: [], approvalPackage: "" },
+              replayPackage: "# QuorumMind Run Audit Replay"
+            },
+            bundle: {
+              manifest: {
+                formatVersion: 1,
+                runId: "run-1",
+                createdAt: "2026-08-21T08:00:00.000Z",
+                linkedPullRequests: [42],
+                linkedAdrPaths: ["docs/ADR-042-auth.md"],
+                eventCount: 2,
+                artifactCount: 1,
+                providerCallCount: 1,
+                permissionDecisionCount: 1,
+                githubReviewCount: 1
+              },
+              replay: {},
+              files: [],
+              markdown: "# QuorumMind Run Audit Bundle"
+            }
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          }
+        );
+      }
+      if (url === "/api/agent-runs/audit/diff?base=run-a&target=run-1") {
+        return new Response(
+          JSON.stringify({
+            diff: {
+              baseRunId: "run-a",
+              targetRunId: "run-1",
+              statusChanged: false,
+              summaryChanged: true,
+              metricDelta: { eventCount: 1, artifactCount: 1, providerCallCount: 1, permissionDecisionCount: 0, githubReviewCount: 1, durationMs: 1000 },
+              providerChanges: { added: ["openrouter"], removed: [], unchanged: [] },
+              artifactChanges: { added: ["ADR"], removed: [], unchanged: [] },
+              riskLevelChanges: { added: ["high"], removed: [], unchanged: [] }
+            }
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          }
+        );
+      }
+      return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+    });
+
+    await expect(listRunAuditReplays({ query: "auth", provider: "openrouter", pr: 42 }, fetchImpl)).resolves.toMatchObject({
+      replays: [expect.objectContaining({ runId: "run-1", linkedPullRequests: [42] })]
+    });
+    await expect(getRunAuditReplay("run-1", { bundle: true }, fetchImpl)).resolves.toMatchObject({
+      replay: expect.objectContaining({
+        summary: expect.objectContaining({ runId: "run-1" }),
+        metrics: expect.objectContaining({ permissionDecisionCount: 1 })
+      }),
+      bundle: expect.objectContaining({
+        markdown: "# QuorumMind Run Audit Bundle"
+      })
+    });
+    await expect(diffRunAuditReplays("run-a", "run-1", fetchImpl)).resolves.toMatchObject({
+      diff: expect.objectContaining({
+        providerChanges: { added: ["openrouter"], removed: [], unchanged: [] }
+      })
+    });
+    expect(fetchImpl).toHaveBeenCalledWith("/api/agent-runs/audit?query=auth&provider=openrouter&pr=42", expect.objectContaining({ method: "GET" }));
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "/api/agent-runs/run-1/audit?bundle=true",
+      expect.objectContaining({ method: "GET" })
+    );
   });
 });
 

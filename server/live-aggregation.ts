@@ -220,7 +220,11 @@ function proposalAliases(entry: LiveDecisionTraceEntry, index: number, proposalI
     openai: "proposal-openai-0",
     deepseek: "proposal-deepseek-1",
     gemini: "proposal-gemini-2",
-    model_gateway: `proposal-model-gateway-${index}`
+    model_gateway: `proposal-model-gateway-${index}`,
+    anthropic: `proposal-anthropic-${index}`,
+    openrouter: `proposal-openrouter-${index}`,
+    ollama: `proposal-ollama-${index}`,
+    lmstudio: `proposal-lmstudio-${index}`
   };
 
   return uniqueStrings([

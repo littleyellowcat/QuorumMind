@@ -194,6 +194,15 @@ export function LandingPage(props: {
               : "Full audit reports and simple final-plan PDFs coexist, so experts can review the trace while non-technical readers get the answer."}
           </p>
         </article>
+        <article>
+          <span>{locale === "zh" ? "入口" : "Entry points"}</span>
+          <strong>{locale === "zh" ? "CLI 与 GitHub skeleton" : "CLI and GitHub skeletons"}</strong>
+          <p>
+            {locale === "zh"
+              ? "`npm run quorummind` 与 `/qm` 评论解析已经产出本地计划；真实 GitHub 写回和 MCP 执行仍需显式接 runner。"
+              : "`npm run quorummind` and `/qm` comment parsing now produce local plans; real GitHub write-back and MCP execution still require an explicit runner."}
+          </p>
+        </article>
       </section>
     </main>
   );

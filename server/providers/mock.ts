@@ -4,14 +4,22 @@ const proposalIds: Record<ImplementedProviderId, string> = {
   model_gateway: "gateway-balanced-proposal",
   openai: "gpt-balanced-proposal",
   deepseek: "deepseek-cost-risk-proposal",
-  gemini: "gemini-strategy-proposal"
+  gemini: "gemini-strategy-proposal",
+  anthropic: "anthropic-safety-proposal",
+  openrouter: "openrouter-marketplace-proposal",
+  ollama: "ollama-local-proposal",
+  lmstudio: "lmstudio-local-proposal"
 };
 
 const providerScores: Record<ImplementedProviderId, number> = {
   model_gateway: 82,
   openai: 88,
   deepseek: 84,
-  gemini: 80
+  gemini: 80,
+  anthropic: 86,
+  openrouter: 83,
+  ollama: 78,
+  lmstudio: 77
 };
 
 export function createMockProvider(id: ImplementedProviderId, model: string): ModelProvider {

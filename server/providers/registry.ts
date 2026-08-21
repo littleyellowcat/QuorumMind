@@ -1,8 +1,11 @@
+import { createAnthropicProvider } from "./anthropic";
 import { createDeepSeekProvider } from "./deepseek";
 import { createGeminiProvider } from "./gemini";
+import { createLMStudioProvider, createOllamaProvider } from "./local-openai-compatible";
 import { createModelGatewayProvider } from "./model-gateway";
 import { createMockProviderSet } from "./mock";
 import { createOpenAIProvider } from "./openai";
+import { createOpenRouterProvider } from "./openrouter";
 import { evaluateProviderPolicy, isProviderPolicyAllowed, parseProviderPolicy, type ProviderPolicyDecision } from "./provider-policy";
 import type { ImplementedProviderId, ModelProvider, ProviderId } from "./types";
 
@@ -80,8 +83,8 @@ export const providerRegistry: ProviderRegistryEntry[] = [
     envKey: "ANTHROPIC_API_KEY",
     modelEnvKey: "ANTHROPIC_MODEL",
     defaultModel: "claude-sonnet-4.5",
-    implemented: false,
-    notes: "Reserved for a future Anthropic Messages API adapter."
+    implemented: true,
+    notes: "Implemented through the Anthropic Messages API."
   },
   {
     id: "xai",
@@ -110,8 +113,8 @@ export const providerRegistry: ProviderRegistryEntry[] = [
     envKey: "OPENROUTER_API_KEY",
     modelEnvKey: "OPENROUTER_MODEL",
     defaultModel: "openai/gpt-5.2",
-    implemented: false,
-    notes: "Reserved as a model marketplace/proxy slot."
+    implemented: true,
+    notes: "Implemented through the OpenRouter OpenAI-compatible chat completions API."
   },
   {
     id: "groq",
@@ -159,8 +162,8 @@ export const providerRegistry: ProviderRegistryEntry[] = [
     kind: "local",
     modelEnvKey: "OLLAMA_MODEL",
     defaultModel: "llama3.1",
-    implemented: false,
-    notes: "Reserved for local models through OLLAMA_BASE_URL."
+    implemented: true,
+    notes: "Implemented for local OpenAI-compatible chat completions through OLLAMA_BASE_URL."
   },
   {
     id: "lmstudio",
@@ -168,8 +171,8 @@ export const providerRegistry: ProviderRegistryEntry[] = [
     kind: "local",
     modelEnvKey: "LMSTUDIO_MODEL",
     defaultModel: "local-model",
-    implemented: false,
-    notes: "Reserved for OpenAI-compatible local models through LMSTUDIO_BASE_URL."
+    implemented: true,
+    notes: "Implemented for local OpenAI-compatible chat completions through LMSTUDIO_BASE_URL."
   }
 ];
 
@@ -261,6 +264,55 @@ export function createConfiguredProviders(env: Env): ModelProvider[] {
     }
   }
 
+  if (env.ANTHROPIC_API_KEY) {
+    const model = env.ANTHROPIC_MODEL ?? defaultModelFor("anthropic");
+    if (isLiveModelAllowed(env, "anthropic", model)) {
+      providers.push(
+        createAnthropicProvider({
+          apiKey: env.ANTHROPIC_API_KEY,
+          model
+        })
+      );
+    }
+  }
+
+  if (env.OPENROUTER_API_KEY) {
+    const model = env.OPENROUTER_MODEL ?? defaultModelFor("openrouter");
+    if (isLiveModelAllowed(env, "openrouter", model)) {
+      providers.push(
+        createOpenRouterProvider({
+          apiKey: env.OPENROUTER_API_KEY,
+          model
+        })
+      );
+    }
+  }
+
+  if (env.OLLAMA_BASE_URL) {
+    const model = env.OLLAMA_MODEL ?? defaultModelFor("ollama");
+    if (isLiveModelAllowed(env, "ollama", model)) {
+      providers.push(
+        createOllamaProvider({
+          baseUrl: env.OLLAMA_BASE_URL,
+          model
+        })
+      );
+    }
+  }
+
+  if (env.LMSTUDIO_BASE_URL) {
+    const model = env.LMSTUDIO_MODEL ?? defaultModelFor("lmstudio");
+    if (isLiveModelAllowed(env, "lmstudio", model)) {
+      providers.push(
+        createLMStudioProvider({
+          baseUrl: env.LMSTUDIO_BASE_URL,
+          apiKey: env.LMSTUDIO_API_KEY,
+          model
+        })
+      );
+    }
+  }
+
   return providers;
 }
 
@@ -279,7 +331,7 @@ function seatsForGateway(env: Env): GatewaySeat[] {
   if (env.MODEL_GATEWAY_MODELS) {
     return modelsFromCommaSeparatedValue(env.MODEL_GATEWAY_MODELS).map((model, index) => ({
       model,
-      providerId: namedGatewaySeatIds[index] ?? "model_gateway"
+      providerId: inferGatewaySeatProviderId(model, namedGatewaySeatIds[index] ?? "model_gateway")
     }));
   }
 
@@ -295,8 +347,14 @@ function seatsForGateway(env: Env): GatewaySeat[] {
     {
       model: env.MODEL_GATEWAY_GEMINI_MODEL,
       providerId: "gemini" as const
+    },
+    {
+      model: env.MODEL_GATEWAY_ANTHROPIC_MODEL,
+      providerId: "anthropic" as const
     }
-  ].flatMap((seat) => (seat.model ? [{ model: seat.model, providerId: seat.providerId }] : []));
+  ].flatMap((seat) =>
+    seat.model ? [{ model: seat.model, providerId: inferGatewaySeatProviderId(seat.model, seat.providerId) }] : []
+  );
 
   if (namedSeats.length > 0) {
     return namedSeats;
@@ -304,7 +362,7 @@ function seatsForGateway(env: Env): GatewaySeat[] {
 
   return modelsFromCommaSeparatedValue(defaultModelFor("model_gateway")).map((model, index) => ({
     model,
-    providerId: namedGatewaySeatIds[index] ?? "model_gateway"
+    providerId: inferGatewaySeatProviderId(model, namedGatewaySeatIds[index] ?? "model_gateway")
   }));
 }
 
@@ -313,7 +371,8 @@ function modelForStatus(entry: ProviderRegistryEntry, env: Env): string {
     const namedSeatModels = [
       env.MODEL_GATEWAY_GPT_MODEL,
       env.MODEL_GATEWAY_DEEPSEEK_MODEL,
-      env.MODEL_GATEWAY_GEMINI_MODEL
+      env.MODEL_GATEWAY_GEMINI_MODEL,
+      env.MODEL_GATEWAY_ANTHROPIC_MODEL
     ].flatMap((model) => (model ? [model] : []));
 
     return env.MODEL_GATEWAY_MODELS ?? (namedSeatModels.length > 0 ? namedSeatModels.join(",") : entry.defaultModel);
@@ -327,6 +386,28 @@ function modelsFromCommaSeparatedValue(value: string): string[] {
     .split(",")
     .map((model) => model.trim())
     .filter(Boolean);
+}
+
+function inferGatewaySeatProviderId(model: string, fallback: ImplementedProviderId): ImplementedProviderId {
+  const normalized = model.toLowerCase();
+
+  if (normalized.includes("deepseek")) {
+    return "deepseek";
+  }
+
+  if (normalized.includes("gemini")) {
+    return "gemini";
+  }
+
+  if (normalized.includes("claude") || normalized.includes("anthropic")) {
+    return "anthropic";
+  }
+
+  if (normalized.includes("gpt") || normalized.includes("openai")) {
+    return "openai";
+  }
+
+  return fallback;
 }
 
 function isLiveModelAllowed(env: Env, providerId: ImplementedProviderId, model: string): boolean {

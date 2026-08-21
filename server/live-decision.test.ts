@@ -17,10 +17,10 @@ const context: DecisionContext = {
   assumptions: ["No strict compliance need at launch"]
 };
 
-function fakeProvider(id: ModelProvider["id"], requests: ProviderRequest[]): ModelProvider {
+function fakeProvider(id: ModelProvider["id"], requests: ProviderRequest[], model = `${id}-test-model`): ModelProvider {
   return {
     id,
-    model: `${id}-test-model`,
+    model,
     async generateDecisionText(request) {
       requests.push(request);
       return JSON.stringify({
@@ -423,6 +423,86 @@ describe("runLiveDecisionTrace", () => {
           validationStatus: "valid"
         })
       ]
+    });
+  });
+
+  it("derives live agent names from configured model names", async () => {
+    const requests: ProviderRequest[] = [];
+    const trace = await runLiveDecisionTrace({
+      providers: [
+        fakeProvider("openai", requests, "gpt-5.5"),
+        fakeProvider("deepseek", requests, "deepseek-v4-pro"),
+        fakeProvider("anthropic", requests, "claude-sonnet-4-6")
+      ],
+      question: "Should we use shared tables?",
+      locale: "en",
+      mode: "fast",
+      maxPhases: 1,
+      context
+    });
+
+    expect(trace.map((entry) => entry.agentName)).toEqual([
+      "GPT 5.5 Product Architect",
+      "DeepSeek V4 Pro Cost/Risk Critic",
+      "Claude Sonnet 4.6 Safety Reviewer"
+    ]);
+    expect(requests.map((request) => request.agentName)).toEqual([
+      "GPT 5.5 Product Architect",
+      "DeepSeek V4 Pro Cost/Risk Critic",
+      "Claude Sonnet 4.6 Safety Reviewer"
+    ]);
+    expect(trace[2]).toMatchObject({
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      agentRole: "sre_reviewer"
+    });
+    expect(requests[2]).toMatchObject({
+      scoringFocus: ["safety", "reliability", "migration flexibility"]
+    });
+  });
+
+  it("uses configured model names for unknown provider families instead of stale fallback labels", async () => {
+    const requests: ProviderRequest[] = [];
+    const trace = await runLiveDecisionTrace({
+      providers: [fakeProvider("openrouter", requests, "qwen3-max")],
+      question: "Should we use shared tables?",
+      locale: "en",
+      mode: "fast",
+      maxPhases: 1,
+      context
+    });
+
+    expect(trace[0]).toMatchObject({
+      provider: "openrouter",
+      model: "qwen3-max",
+      agentName: "Qwen3 Max Architecture Reviewer",
+      agentRole: "principal_architect"
+    });
+    expect(requests[0]).toMatchObject({
+      agentName: "Qwen3 Max Architecture Reviewer",
+      scoringFocus: ["architecture coherence", "risk exposure", "team feasibility"]
+    });
+  });
+
+  it("strips marketplace namespaces from model display names", async () => {
+    const requests: ProviderRequest[] = [];
+    const trace = await runLiveDecisionTrace({
+      providers: [fakeProvider("openrouter", requests, "anthropic/claude-sonnet-4-6")],
+      question: "Should we use shared tables?",
+      locale: "en",
+      mode: "fast",
+      maxPhases: 1,
+      context
+    });
+
+    expect(trace[0]).toMatchObject({
+      provider: "openrouter",
+      model: "anthropic/claude-sonnet-4-6",
+      agentName: "Claude Sonnet 4.6 Safety Reviewer",
+      agentRole: "sre_reviewer"
+    });
+    expect(requests[0]).toMatchObject({
+      agentName: "Claude Sonnet 4.6 Safety Reviewer"
     });
   });
 

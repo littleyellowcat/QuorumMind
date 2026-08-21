@@ -8,11 +8,27 @@ import {
   type DecisionHistoryRecord
 } from "./lib/decision-history";
 import {
+  checkTeamAccess,
+  createTeamAdrApproval,
+  createTeamWorkspace,
+  diffRunAuditReplays,
   type AutonomousBlueprintRun,
+  type AdrApprovalRecord,
   type BlueprintExecutionMode,
   type DecisionApiHealth,
   type DecisionApiResponse,
-  type ProviderConnectionTestResponse
+  getRunAuditReplay,
+  getTeamWorkspace,
+  listRunAuditReplays,
+  replyTeamAdrApproval,
+  type PostgresPersistenceContract,
+  type ProviderConnectionTestResponse,
+  type RunAuditBundle,
+  type RunAuditReplay,
+  type RunAuditReplayDiffResponse,
+  type RunAuditReplayListItem,
+  type TeamAccessDecision,
+  type TeamWorkspace
 } from "./lib/api-client";
 import type {
   ApiSecurityPosture,
@@ -37,6 +53,9 @@ import { PanelHeading } from "./components/PanelTitle";
 import { WorkbenchIntro } from "./components/WorkbenchIntro";
 import { LandingPage } from "./components/LandingPage";
 import { ProviderPolicyStatusPanel } from "./components/ProviderPolicyStatusPanel";
+import { PermissionAuditCenter } from "./components/PermissionAuditCenter";
+import { AuditReplayCenter } from "./components/AuditReplayCenter";
+import { TeamWorkspaceCenter } from "./components/TeamWorkspaceCenter";
 import { DecisionResultView } from "./components/DecisionResultView";
 import { BlueprintResultView } from "./components/BlueprintResultView";
 import { DecisionInspector } from "./components/DecisionInspector";
@@ -48,6 +67,7 @@ import { useModelFeedback } from "./hooks/useModelFeedback";
 import { useDecisionRuns } from "./hooks/useDecisionRuns";
 import { useBlueprintRuns } from "./hooks/useBlueprintRuns";
 import { useRunHistory } from "./hooks/useRunHistory";
+import { usePermissionAudit } from "./hooks/usePermissionAudit";
 import {
   AgentConfigPanel,
   ContextPanel,
@@ -103,6 +123,16 @@ export default function App() {
   const [health, setHealth] = useState<DecisionApiHealth | null>(null);
   const [securityPosture, setSecurityPosture] = useState<ApiSecurityPosture | null>(null);
   const [providerTest, setProviderTest] = useState<ProviderConnectionTestResponse | null>(null);
+  const [auditReplays, setAuditReplays] = useState<RunAuditReplayListItem[]>([]);
+  const [selectedAuditReplay, setSelectedAuditReplay] = useState<RunAuditReplay | null>(null);
+  const [selectedAuditBundle, setSelectedAuditBundle] = useState<RunAuditBundle | null>(null);
+  const [auditReplayDiff, setAuditReplayDiff] = useState<RunAuditReplayDiffResponse["diff"] | null>(null);
+  const [auditReplayLoading, setAuditReplayLoading] = useState(false);
+  const [teamWorkspace, setTeamWorkspace] = useState<TeamWorkspace | null>(null);
+  const [teamAccess, setTeamAccess] = useState<TeamAccessDecision | null>(null);
+  const [teamApprovals, setTeamApprovals] = useState<AdrApprovalRecord[]>([]);
+  const [teamPersistence, setTeamPersistence] = useState<PostgresPersistenceContract | { mode: string; configured: boolean } | null>(null);
+  const [teamWorkspaceLoading, setTeamWorkspaceLoading] = useState(false);
   const [historyRecords, setHistoryRecords] = useState<DecisionHistoryRecord[]>(() => readDecisionHistoryRecords());
   const [reputationFeedback, setReputationFeedback] = useState(() => readModelReputationFeedback());
   const [running, setRunning] = useState<RunProgress | null>(null);
@@ -216,6 +246,140 @@ export default function App() {
     setBlueprintQuestions,
     setAgentRun
   });
+  const {
+    audit: permissionAudit,
+    lifecycle: permissionLifecycle,
+    loading: permissionAuditLoading,
+    replyToPermissionApproval,
+    revokeSavedPermissionApproval
+  } = usePermissionAudit();
+
+  const refreshAuditReplays = async () => {
+    setAuditReplayLoading(true);
+    try {
+      const list = await listRunAuditReplays();
+      setAuditReplays(list.replays);
+      const nextRunId = selectedAuditReplay?.summary.runId ?? list.replays[0]?.runId;
+      if (nextRunId) {
+        const detail = await getRunAuditReplay(nextRunId);
+        setSelectedAuditReplay(detail.replay);
+        setSelectedAuditBundle(null);
+        setAuditReplayDiff(null);
+      } else {
+        setSelectedAuditReplay(null);
+        setSelectedAuditBundle(null);
+        setAuditReplayDiff(null);
+      }
+    } catch (error) {
+      setSelectedAuditReplay(null);
+      setSelectedAuditBundle(null);
+      setAuditReplayDiff(null);
+      setRuntimeNotice(error instanceof Error ? error.message : locale === "zh" ? "运行审计回放加载失败。" : "Run audit replay failed to load.");
+    } finally {
+      setAuditReplayLoading(false);
+    }
+  };
+
+  const selectAuditReplay = async (runId: string) => {
+    setAuditReplayLoading(true);
+    try {
+      const detail = await getRunAuditReplay(runId);
+      setSelectedAuditReplay(detail.replay);
+      setSelectedAuditBundle(null);
+      setAuditReplayDiff(null);
+    } catch (error) {
+      setRuntimeNotice(error instanceof Error ? error.message : locale === "zh" ? "运行审计详情加载失败。" : "Run audit detail failed to load.");
+    } finally {
+      setAuditReplayLoading(false);
+    }
+  };
+
+  const loadAuditBundle = async (runId: string) => {
+    setAuditReplayLoading(true);
+    try {
+      const detail = await getRunAuditReplay(runId, { bundle: true });
+      setSelectedAuditReplay(detail.replay);
+      setSelectedAuditBundle(detail.bundle ?? null);
+    } catch (error) {
+      setRuntimeNotice(error instanceof Error ? error.message : locale === "zh" ? "运行审计包加载失败。" : "Run audit bundle failed to load.");
+    } finally {
+      setAuditReplayLoading(false);
+    }
+  };
+
+  const compareAuditReplays = async (baseRunId: string, targetRunId: string) => {
+    setAuditReplayLoading(true);
+    try {
+      const detail = await diffRunAuditReplays(baseRunId, targetRunId);
+      setAuditReplayDiff(detail.diff);
+    } catch (error) {
+      setRuntimeNotice(error instanceof Error ? error.message : locale === "zh" ? "运行差异加载失败。" : "Run diff failed to load.");
+    } finally {
+      setAuditReplayLoading(false);
+    }
+  };
+
+  const refreshTeamWorkspace = async () => {
+    setTeamWorkspaceLoading(true);
+    try {
+      let workspaceResponse;
+      try {
+        workspaceResponse = await getTeamWorkspace("architecture");
+      } catch {
+        workspaceResponse = await createTeamWorkspace({
+          id: "architecture",
+          name: locale === "zh" ? "架构委员会" : "Architecture Council",
+          persistenceMode: health?.persistence.mode === "sqlite" ? "sqlite" : "browser_local",
+          members: [
+            { userId: "alice", role: "owner" },
+            { userId: "bob", role: "reviewer" }
+          ]
+        });
+      }
+
+      const accessResponse = await checkTeamAccess({
+        workspaceId: workspaceResponse.workspace.id,
+        userId: "bob",
+        action: "approve_adr"
+      });
+      let approvals = workspaceResponse.approvals ?? [];
+      if (approvals.length === 0) {
+        const approvalResponse = await createTeamAdrApproval({
+          workspaceId: workspaceResponse.workspace.id,
+          adrId: "ADR-architecture-review",
+          title: locale === "zh" ? "架构评审 ADR 审批" : "Architecture review ADR approval",
+          requestedBy: "alice",
+          requiredApprovers: ["bob"]
+        });
+        approvals = [approvalResponse.approval];
+      }
+
+      setTeamWorkspace(workspaceResponse.workspace);
+      setTeamPersistence(workspaceResponse.persistenceContract ?? null);
+      setTeamAccess(accessResponse.access);
+      setTeamApprovals(approvals);
+    } catch (error) {
+      setRuntimeNotice(error instanceof Error ? error.message : locale === "zh" ? "团队工作区加载失败。" : "Team workspace failed to load.");
+    } finally {
+      setTeamWorkspaceLoading(false);
+    }
+  };
+
+  const replyToTeamAdrApproval = async (approvalId: string, decision: "approve" | "request_changes") => {
+    try {
+      const response = await replyTeamAdrApproval(approvalId, {
+        userId: "bob",
+        decision,
+        note: decision === "approve"
+          ? "Architecture review is ready for ADR handoff."
+          : "Please tighten risks, rollback, and owner notes before approval."
+      });
+      setTeamApprovals((current) => current.map((approval) => approval.id === approvalId ? response.approval : approval));
+      setRuntimeNotice(locale === "zh" ? "ADR 审批状态已更新。" : "ADR approval updated.");
+    } catch (error) {
+      setRuntimeNotice(error instanceof Error ? error.message : locale === "zh" ? "ADR 审批更新失败。" : "ADR approval update failed.");
+    }
+  };
 
   function updateCurrentQuestion(value: string) {
     setRuntimeNotice(null);
@@ -236,6 +400,16 @@ export default function App() {
   useEffect(() => {
     void refreshApiStatus();
   }, [refreshApiStatus]);
+
+  useEffect(() => {
+    void refreshAuditReplays();
+  }, []);
+
+  useEffect(() => {
+    if (appSurface === "workbench") {
+      void refreshTeamWorkspace();
+    }
+  }, [appSurface]);
 
   useEffect(() => {
     localStorage.setItem("quorummind.locale", locale);
@@ -313,11 +487,11 @@ export default function App() {
   const workbenchHint =
     workspaceMode === "decision"
       ? locale === "zh"
-        ? "输入取舍问题，运行后查看共识、分歧、风险和可导出的 ADR。"
-        : "Enter a trade-off question, then review consensus, dissent, risks, and an exportable ADR."
+        ? "输入架构评审或技术取舍问题，运行后查看共识、分歧、风险、权限审计和可导出的 ADR。"
+        : "Enter an architecture review or technical trade-off, then inspect consensus, dissent, risks, permission audit, and exportable ADR."
       : locale === "zh"
-        ? "输入开放式需求，运行后查看 Agent 分工、工作流、风险和最终方案。"
-        : "Enter an open-ended request, then review agents, workflow, risks, and the final blueprint.";
+        ? "输入 Agent 系统或复杂技术方案需求，运行后查看分工、工作流、模型分歧、风险和最终蓝图。"
+        : "Enter an Agent-system or complex technical design request, then inspect roles, workflow, model dissent, risks, and final Blueprint.";
   const workbenchSourceLabel = sourceProviderMode === "live" ? t.liveSource : sourceProviderMode === "demo" ? t.demoSource : locale === "zh" ? "等待连接" : "Waiting";
 
   if (appSurface === "landing") {
@@ -610,6 +784,96 @@ export default function App() {
             }
           >
             <HistoryPanel locale={locale} records={historyRecords} onRestore={handleRestoreHistory} />
+          </SidebarDisclosure>
+
+          <SidebarDisclosure
+            title={locale === "zh" ? "运行审计回放" : "Run audit replay"}
+            summary={
+              locale === "zh"
+                ? "回放服务端运行事件、模型调用、GitHub 输出和权限决策。"
+                : "Replay server-side run events, model calls, GitHub outputs, and permission decisions."
+            }
+          >
+            <AuditReplayCenter
+              locale={locale}
+              replays={auditReplays}
+              selectedReplay={selectedAuditReplay}
+              selectedBundle={selectedAuditBundle}
+              replayDiff={auditReplayDiff}
+              loading={auditReplayLoading}
+              onRefresh={() => {
+                void refreshAuditReplays();
+              }}
+              onSelectReplay={(runId) => {
+                void selectAuditReplay(runId);
+              }}
+              onCopyReplayPackage={() => copyText(selectedAuditReplay?.replayPackage ?? "", t.copied)}
+              onLoadBundle={(runId) => {
+                void loadAuditBundle(runId);
+              }}
+              onCopyBundle={() => copyText(selectedAuditBundle?.markdown ?? "", t.copied)}
+              onCompareReplay={(baseRunId, targetRunId) => {
+                void compareAuditReplays(baseRunId, targetRunId);
+              }}
+            />
+          </SidebarDisclosure>
+
+          <SidebarDisclosure
+            title={locale === "zh" ? "团队与 ADR 审批" : "Team and ADR approval"}
+            summary={
+              locale === "zh"
+                ? "查看团队访问、持久化状态和 ADR 审批流。"
+                : "Review team access, persistence status, and ADR approval flow."
+            }
+          >
+            <TeamWorkspaceCenter
+              locale={locale}
+              workspace={teamWorkspace}
+              access={teamAccess}
+              approvals={teamApprovals}
+              persistence={teamPersistence}
+              loading={teamWorkspaceLoading}
+              onRefresh={() => {
+                void refreshTeamWorkspace();
+              }}
+              onApproveAdr={(approvalId) => {
+                void replyToTeamAdrApproval(approvalId, "approve");
+              }}
+              onRequestChanges={(approvalId) => {
+                void replyToTeamAdrApproval(approvalId, "request_changes");
+              }}
+            />
+          </SidebarDisclosure>
+
+          <SidebarDisclosure
+            title={t.permissionAuditCenter}
+            summary={
+              locale === "zh"
+                ? "查看工具调用授权、人工确认、阻止与脱敏摘要。"
+                : "Review tool-call authorization, human gates, blocks, and redaction summaries."
+            }
+          >
+            <PermissionAuditCenter
+              locale={locale}
+              audit={permissionAudit}
+              lifecycle={permissionLifecycle}
+              loading={permissionAuditLoading}
+              onCopyPackage={() => copyText(permissionAudit?.approvalPackage ?? "", t.copied)}
+              onReply={(approvalId, reply) => {
+                void replyToPermissionApproval(approvalId, reply)
+                  .then(() => setRuntimeNotice(locale === "zh" ? "审批状态已更新。" : "Approval status updated."))
+                  .catch((error: unknown) =>
+                    setRuntimeNotice(error instanceof Error ? error.message : locale === "zh" ? "审批更新失败。" : "Approval update failed.")
+                  );
+              }}
+              onRevoke={(approvalId) => {
+                void revokeSavedPermissionApproval(approvalId)
+                  .then(() => setRuntimeNotice(locale === "zh" ? "审批已撤销。" : "Approval revoked."))
+                  .catch((error: unknown) =>
+                    setRuntimeNotice(error instanceof Error ? error.message : locale === "zh" ? "撤销审批失败。" : "Approval revoke failed.")
+                  );
+              }}
+            />
           </SidebarDisclosure>
         </aside>
 

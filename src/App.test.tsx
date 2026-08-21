@@ -38,7 +38,7 @@ describe("QuorumMind app", () => {
       fireEvent.click(screen.getByRole("button", { name: "中文" }));
     });
 
-    expect(screen.getByText(/让复杂决策形成可审查共识/i)).toBeInTheDocument();
+    expect(screen.getByText(/在可审计决策室里评审复杂技术选择/i)).toBeInTheDocument();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /进入工作台/i }));

@@ -1,8 +1,8 @@
 # QuorumMind
 
-QuorumMind is an adversarial multi-agent architecture decision engine.
+QuorumMind is an auditable multi-model decision room for architecture reviews, Agent-system design, and complex technical decisions.
 
-It turns architecture trade-offs into a structured Decision Room: expert agents generate independent proposals, critique each other, revise their recommendations, compute consensus scores, and export an Architecture Decision Record (ADR).
+It turns architecture trade-offs and open-ended technical requirements into a structured Decision Room: expert agents generate independent proposals, critique each other, revise their recommendations, compute consensus scores, preserve the disagreement trail, and export an Architecture Decision Record (ADR) or Blueprint.
 
 ## What This MVP Demonstrates
 
@@ -13,7 +13,16 @@ It turns architecture trade-offs into a structured Decision Room: expert agents 
 - Blueprint execution switch for **Live model deep Blueprint** versus **Fast deterministic**, with visible provider/model call trace, provider phase budget, rough call/token/timeout estimates, and explicit deterministic fallback messaging.
 - Blueprint UI entry for the Agent platform: stable checkpoint thread, configurable max consensus rounds, runtime limits, task tree, tool permissions, executor actions, critic reviews, memory events, supervisor decisions, route decisions, termination reason, live provider trace, tool calls, and node trace are visible in the browser.
 - Blueprint process visualization for consensus trend, model differences, contribution map, critique adoption flow, and history comparison across repeated Blueprint runs.
-- Provider registry with implemented adapters for OpenAI, DeepSeek, and Gemini, plus reserved slots for future models.
+- Provider registry with implemented adapters for OpenAI, DeepSeek, Gemini, Anthropic, OpenRouter, Ollama, LM Studio, and a unified OpenAI-compatible gateway, plus reserved slots for future models.
+- Provider capability matrix and bounded probe endpoint for implemented, reserved, marketplace, and local-model slots, including JSON schema stability, tool-call, long-context, low-cost-mode, latency, repair-rate, and failure-rate labels.
+- Local `quorummind.config.json` parser for MCP server declarations, custom tool manifests, per-agent tool access, and provider overrides. The API lists manifests safely, executes read-only custom tools, and the MCP runtime can start stdio sessions for read-only tools behind permission governance.
+- CLI through `npm run quorummind -- decide|blueprint|review-pr|export|init|runs|status|watch|audit|route-provider|eval|team`: API commands support argv/stdin/file input and session metadata, `review-pr` creates a local PR architecture review package, `audit` exports replay bundles or diffs runs, `route-provider` explains model-seat selection, `eval` runs local golden-case quality gates, and `team` checks workspace access.
+- GitHub issue/PR command parser and runner for `/quorummind` and `/qm` comments. The runner can ingest changed files, diff patches, issue comments, labels, and review history, defaults to dry-run summaries, and emits hardened native GitHub Check Run / PR Review payloads with patch-line mapping, duplicate suppression, validation status workflow, Suggested ADR text, and minimum permission notes.
+- Repository workspace model API for file tree, selected file previews, ADR history, dependency/import graph, architecture boundaries, API surface, evidence IDs, change impact, hotspots, test evidence, and CI evidence.
+- Permission audit center for tool approvals: why a tool was allowed, human-gated, blocked, redacted, or truncation-prone, plus copyable approval packages, approve/always/reject replies, lifecycle summaries, expiry/revocation metadata, and risk history by tool/provider.
+- Decision Quality Eval for local golden cases, rubric judging, provider reputation summaries, and trend entries without calling external judge models.
+- Provider Capability Router for task-specific model-seat selection, local-only/low-cost routing, and model-dependent capability warnings.
+- Team workspace foundation for member roles, ADR approval workflow, access checks, and a Postgres persistence contract that does not expose connection strings or require a database driver in local-first mode.
 - Live provider trace for proposal, critique, revision, ranking, and verdict phases.
 - Delphi Consensus Protocol log for proposal, blind review, cross-examination, revision, consensus, and final verdict rounds.
 - Blind Review critique payloads that anonymize proposal authors as Proposal A/B/C before cross-examination.
@@ -97,6 +106,30 @@ Open `http://localhost:5173`. Docker defaults to mock live providers, so it does
 
 Docker also enables SQLite persistence by default at `/data/quorummind.db` through the `quorummind-data` named volume.
 
+Local CLI:
+
+```bash
+npm run quorummind -- decide "Should we split this monolith now?"
+npm run quorummind -- decide --stdin --session arch-1 < question.md
+npm run quorummind -- blueprint "Design a multi-agent architecture review workflow"
+npm run quorummind -- blueprint --file request.md
+npm run quorummind -- review-pr --pr 42 "focus on auth boundaries"
+npm run quorummind -- export --adr --from latest-run.json
+npm run quorummind -- init --print
+npm run quorummind -- init --github-action
+npm run quorummind -- runs --from ~/.quorummind/runs
+npm run quorummind -- status --from latest-run.json
+npm run quorummind -- audit --run run-id
+npm run quorummind -- audit --diff base-run target-run
+npm run quorummind -- route-provider --task architecture_review --json-schema --long-context
+npm run quorummind -- eval --suite offline-smoke
+npm run quorummind -- team --workspace architecture --user alice --action approve_adr
+npm run quorummind -- doctor
+npm run quorummind -- --version
+```
+
+`decide` and `blueprint` call the local API at `http://127.0.0.1:8787` by default; set `QUORUMMIND_API_BASE_URL` to point at another local gateway. `review-pr` creates a dry-run architecture review package without writing GitHub comments. `export --json|--adr` reads a saved run file; PDF export remains available through the existing local `/api/exports/pdf` endpoint. `audit`, `route-provider`, `eval`, and `team` are local-first CLI surfaces and do not require the API server. `init --print` prints a starter `quorummind.config.json`; `init --github-action` prints a `.github/workflows/quorummind-review.yml` scaffold. `doctor` checks the npm bin wrapper, composite GitHub Action, quickstart, and workflow template.
+
 ## Agent Platform Blueprint
 
 In the browser, switch **Workspace mode** to **Blueprint**, then use **Agent runtime**:
@@ -135,28 +168,118 @@ GEMINI_API_KEY=...
 
 The browser never receives these keys. The React app calls `/api/decisions`, Vite proxies that request to the local API server, and the server decides whether to use demo fallback or configured providers.
 
-Provider slots are centralized in `server/providers/registry.ts`.
+Provider slots are centralized in `server/providers/registry.ts`, with capability labels in `server/providers/capabilities.ts`.
 
 Implemented now:
 
+- `MODEL_GATEWAY_API_KEY` + `MODEL_GATEWAY_BASE_URL`
 - `DEEPSEEK_API_KEY`
 - `OPENAI_API_KEY`
 - `GEMINI_API_KEY`
+- `ANTHROPIC_API_KEY`
+- `OPENROUTER_API_KEY`
+- `OLLAMA_BASE_URL`
+- `LMSTUDIO_BASE_URL`
 
 Reserved for later adapters:
 
-- `ANTHROPIC_API_KEY`
 - `XAI_API_KEY`
 - `MISTRAL_API_KEY`
-- `OPENROUTER_API_KEY`
 - `GROQ_API_KEY`
 - `TOGETHER_API_KEY`
 - `COHERE_API_KEY`
 - `PERPLEXITY_API_KEY`
-- `OLLAMA_BASE_URL`
-- `LMSTUDIO_BASE_URL`
 
-`/api/health` reports every provider slot as `configured` and `implemented` without returning secret values.
+`/api/health` reports `configured` and `implemented` flags for every provider slot, adds a provider capability matrix with capability provenance, and includes a sanitized `quorummind.config.json` summary without returning secret values.
+
+`POST /api/providers/probe` measures JSON schema stability, failure rate, average latency, repair rate, and recommended use cases for configured providers. Real probes are disabled unless `QUORUMMIND_PROVIDER_PROBE_ENABLED=1` is set; mock probes work with `QUORUMMIND_MOCK_PROVIDERS=1`.
+
+## Config, MCP, And Tool Manifests
+
+QuorumMind reads an optional `quorummind.config.json` from the project root, or from `QUORUMMIND_CONFIG_DIR` when set. The API exposes sanitized manifests and supports a first read-only custom tool execution path:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "stored-locally"
+      }
+    }
+  },
+  "customTools": [
+    {
+      "name": "risk_ledger",
+      "description": "Summarize architecture risks",
+      "inputSchema": { "type": "object" }
+    }
+  ],
+  "agents": {
+    "blueprint": {
+      "tools": ["risk_ledger", "mcp:github"]
+    }
+  },
+  "providers": {
+    "openrouter": { "enabled": true, "model": "anthropic/claude-sonnet-4.5" },
+    "ollama": { "enabled": true, "baseUrl": "http://127.0.0.1:11434", "model": "llama3.1" }
+  }
+}
+```
+
+The API exposes only names, configured env-key names, provider ids, models, and base-URL presence. It does not expose env values. `GET /api/tools/manifests` lists MCP/custom tools. `POST /api/tools/read-only` can execute configured read-only custom tools such as repo diff evidence summarization when the requesting agent has that tool in its allowlist. `server/tools/mcp-runtime.ts` can start stdio MCP sessions from server-side code, list tools, and call read-only tool names through the permission audit store. No public HTTP route starts arbitrary MCP server processes.
+
+## GitHub Comment Mode
+
+`server/github/quorummind-command.ts` parses GitHub comments such as:
+
+```text
+/quorummind decide Should we keep shared tenant tables?
+/qm blueprint Design the review workflow
+/quorummind review-pr --pr 42 focus on auth boundaries
+```
+
+`POST /api/github/run` and `github/action.yml` turn matching comments into an architecture review package using supplied PR/repo evidence. `server/github/github-context.ts` can fetch PR files, patches, issue comments, labels, and review history when a GitHub token is supplied by a runner. The runner returns native GitHub payloads for Check Run annotations, PR Review comments, and a Suggested ADR block. Native payloads are validated, annotations/comments are mapped to changed patch lines when hunk data exists, duplicate comments are suppressed, and the output includes a `queued -> in_progress -> completed` status workflow plus minimum permissions: `contents: read`, `pull-requests: write`, and `checks: write`. The default mode is dry-run: it writes a GitHub step summary or API response body but does not push commits or open PRs. Set `output_mode: "comment" | "check" | "pr_review" | "all"` to choose the summary payload. Set `write_comment: "true"` only when you explicitly want a normal comment posted. Set `write_github: "true"` only when you explicitly want native Check Run or PR Review writes. `npm run github:e2e` and `POST /api/github/e2e` validate the `/qm review-pr -> Check Run -> PR Review` loop in mock mode by default; live writes require both `QUORUMMIND_GITHUB_E2E_WRITE=1` and GitHub credentials.
+
+## Run Audit Replay
+
+`GET /api/agent-runs/audit` lists server-side run audit summaries and supports search/filter by query, status, kind, provider, PR number, ADR path, and risk level. `GET /api/agent-runs/:runId/audit` merges run status, event timeline, provider calls, artifacts, GitHub native review outputs, and permission audit into a copyable replay package. Add `?bundle=true` to receive an exportable audit bundle with manifest, linked PRs, linked ADRs, artifact files, and Markdown. `GET /api/agent-runs/audit/diff?base=<run>&target=<run>` compares status, metrics, providers, artifacts, and risk levels. The Workbench exposes linked PR/ADR/provider/risk metadata, bundle manifest details, and run-to-run diffs in **Run audit replay**, separate from browser-local decision history.
+
+## Permission Audit Center
+
+`GET /api/permissions/audit` reads local approval records and returns:
+
+- allowed, human-gated, blocked, and redacted/truncated counts
+- why each tool call was allowed, gated, or blocked
+- whether the action needs human confirmation
+- a copyable Markdown approval package
+
+The Workbench exposes this as a **Permission audit** panel. Pending human-gated items can be approved for one run, approved as an always-allowed tool approval, or rejected through `POST /api/permissions/approvals/:id/reply`. `GET /api/permissions/lifecycle` groups pending, approved, denied, expired, and revoked approvals by tool and provider. `POST /api/permissions/approvals/:id/revoke` revokes an always approval without deleting its audit trail.
+
+## Repo Workspace Model
+
+`POST /api/repo/workspace` builds a bounded review model from the local repository root:
+
+- file tree up to a shallow depth
+- selected file line counts and previews
+- ADR history
+- dependency and import graph hints
+- architecture boundaries
+- API surface exports
+- evidence IDs and change impact
+- diff hotspots
+- test output and CI status evidence
+
+## Provider Routing, Quality Eval, And Team Workflow
+
+`POST /api/providers/route` selects configured model seats for a task using the provider capability matrix. It explains selected and excluded providers, warns when JSON schema/tool/long-context support is model-dependent, and supports local-only or low-cost routing.
+
+`POST /api/quality/eval` runs local golden-case rubric judging. It produces findings, a summary, provider reputation bands, and a trend entry. By default this is deterministic and local. An LLM-as-a-Judge pass is available only when the request sets `judge.enabled: true` and the server sets `QUORUMMIND_LLM_JUDGE_ENABLED=1`; the response records judge provider/model, agreement, skip/error status, and a privacy note.
+
+`POST /api/team/workspaces`, `GET /api/team/workspaces/:id`, `POST /api/team/access`, `POST /api/team/adr-approvals`, and `POST /api/team/adr-approvals/:id/reply` provide the team workspace foundation: member roles, action checks, ADR approval records/replies, and a Postgres persistence contract. The Postgres path now includes a query-client repository adapter for deployments that supply a client, while local-first endpoints still avoid opening a database connection or returning connection strings. The Workbench includes a **Team and ADR approval** panel for access, persistence, and approval state.
+
+This is intentionally read-only and scoped to `QUORUMMIND_CONFIG_DIR` or the server working directory.
 
 Current live mode records structured provider traces across `proposal`, `critique`, `revision`, `ranking`, and `verdict` phases. Before critique, proposal payloads are anonymized into `Proposal A`, `Proposal B`, and `Proposal C`, with provider, model, agent name, raw text, and role metadata removed from the review payload. The UI groups trace entries by phase, summarizes call count, failures, latency, JSON parse status, and exposes raw model output for debugging. Provider responses are parsed with a safe extraction layer that accepts strict JSON, Markdown fenced JSON blocks, and narrated responses that contain a balanced JSON payload. When provider JSON contains usable proposal scores and rankings, QuorumMind aggregates those rankings using the same Borda, weighted utility, confidence, and regret-penalty scoring pipeline. That live aggregated verdict is promoted into the primary recommendation panel, and the scoring transparency panel explains the winning path with formula contributions and per-model ranking evidence. The stable deterministic engine remains available as a fallback and ADR baseline until live ADR generation is fully hardened.
 
@@ -416,7 +539,9 @@ Built **QuorumMind**, an adversarial multi-agent architecture decision engine th
 ## Future Work
 
 - Harden live ADR generation from provider JSON with retries and stricter cross-phase validation.
-- Implement reserved provider adapters from `server/providers/registry.ts`.
+- Add real adapters for the still-reserved provider slots: xAI, Mistral, Groq, Together, Cohere, and Perplexity.
+- Extend GitHub mode from review-package/comment output into explicit PR creation or branch commits only after a separate permission and credential design.
+- Add a public MCP session-management API only if the permission model can prove which server commands and write tools are allowed.
 - Server routes for browsing and reopening SQLite-persisted Decision Rooms.
-- GitHub repository and PR architecture review mode.
+- Full Postgres-backed multi-user persistence after the local contract has a deployment target.
 - Interactive pairwise AHP editing, deeper TOPSIS/Monte Carlo calibration, and TrueSkill once enough historical decision data exists.

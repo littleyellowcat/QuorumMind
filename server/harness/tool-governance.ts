@@ -51,6 +51,8 @@ export type ToolPermissionApprovalRecord = {
   scope: ToolPermissionApprovalScope;
   requestedBy: AgentCapabilityRole;
   createdAt: string;
+  expiresAt?: string;
+  revokedAt?: string;
   reason: string;
 };
 
@@ -166,10 +168,16 @@ function matchingSavedApproval(
   return input.savedApprovals?.find(
     (approval) =>
       approval.status === "approved" &&
+      !approval.revokedAt &&
+      !isExpiredApproval(approval) &&
       approval.toolName === input.toolName &&
       approval.category === category &&
       (approval.scope === "tool" || approval.node === (input.node ?? "unknown"))
   );
+}
+
+function isExpiredApproval(approval: ToolPermissionApprovalRecord): boolean {
+  return Boolean(approval.expiresAt && approval.expiresAt <= new Date().toISOString());
 }
 
 function roleBlockReasonFor(

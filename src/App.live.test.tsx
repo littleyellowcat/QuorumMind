@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { DecisionApiResponse } from "./lib/api-client";
+import type { DecisionApiHealth, DecisionApiResponse } from "./lib/api-client";
 import { createManualProviderBundle, defaultManualProviderAgents } from "./lib/manual-provider";
 import { contextForQuestion, defaultQuestions } from "./lib/question-context";
 import { runDecisionRoom } from "./lib/workflow";
@@ -75,14 +75,7 @@ describe("QuorumMind app integration", () => {
       const path = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
 
       if (path === "/api/health") {
-        return Promise.resolve(
-          jsonResponse({
-            status: "ok",
-            providerMode: "demo",
-            persistence: { mode: "browser_local", configured: true },
-            providerStatus: {}
-          })
-        );
+        return Promise.resolve(jsonResponse(healthResponse("demo")));
       }
 
       if (path === "/api/security") {
@@ -203,14 +196,7 @@ describe("QuorumMind app integration", () => {
       const path = typeof url === "string" ? url : url instanceof URL ? url.pathname : url.url;
 
       if (path === "/api/health") {
-        return Promise.resolve(
-          jsonResponse({
-            status: "ok",
-            providerMode: "live",
-            persistence: { mode: "browser_local", configured: true },
-            providerStatus: {}
-          })
-        );
+        return Promise.resolve(jsonResponse(healthResponse("live")));
       }
 
       if (path === "/api/security") {
@@ -258,4 +244,35 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json" }
   });
+}
+
+function healthResponse(providerMode: DecisionApiHealth["providerMode"]): DecisionApiHealth {
+  return {
+    status: "ok",
+    providerMode,
+    persistence: { mode: "browser_local", configured: true },
+    providerStatus: {},
+    providerCapabilities: {
+      openai: {
+        providerId: "openai",
+        displayName: "OpenAI",
+        implementationStatus: "implemented",
+        capabilitySource: "adapter_verified",
+        transport: "api",
+        supportsJsonSchema: true,
+        supportsToolCalls: true,
+        supportsLongContext: true,
+        supportsLowCostMode: true,
+        notes: ["test fixture"]
+      }
+    },
+    configSummary: {
+      loaded: false,
+      errors: [],
+      mcpServers: [],
+      customTools: [],
+      agentToolAccess: [],
+      providerOverrides: []
+    }
+  };
 }

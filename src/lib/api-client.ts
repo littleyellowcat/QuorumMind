@@ -116,7 +116,15 @@ export type BlueprintExecutionSummary = {
 
 export type ProviderTraceEntry = {
   id: string;
-  provider: "model_gateway" | "openai" | "deepseek" | "gemini";
+  provider:
+    | "model_gateway"
+    | "openai"
+    | "deepseek"
+    | "gemini"
+    | "anthropic"
+    | "openrouter"
+    | "ollama"
+    | "lmstudio";
   model: string;
   phase: DecisionTracePhase;
   agentName?: string;
@@ -543,6 +551,20 @@ export type AgentRunReadModelResponse = {
   }>;
 };
 
+export type RunAuditReplayListItem = {
+  runId: string;
+  kind?: AgentRunStatusRecord["kind"];
+  status?: AgentRunStatusRecord["status"];
+  updatedAt?: string;
+  summary?: string;
+  eventCount: number;
+  artifactCount: number;
+  providers: string[];
+  linkedPullRequests: number[];
+  linkedAdrPaths: string[];
+  riskLevels: string[];
+};
+
 export type AgentRunArtifactRecord = {
   kind:
     | "prompt_bundle"
@@ -558,6 +580,165 @@ export type AgentRunArtifactRecord = {
   inline?: unknown;
   sha256?: string;
   metadata?: Record<string, unknown>;
+};
+
+export type RunAuditReplay = {
+  summary: AgentRunReadModelResponse["summary"];
+  metrics: AgentRunReadModelResponse["metrics"] & {
+    permissionDecisionCount: number;
+    githubReviewCount: number;
+  };
+  timeline: AgentRunReadModelResponse["timeline"];
+  providerCalls: Array<{
+    seq?: number;
+    timestamp?: string;
+    phase?: string;
+    provider?: string;
+    model?: string;
+    status: "ok" | "error" | "unknown";
+    durationMs?: number;
+    summary: string;
+  }>;
+  artifacts: AgentRunArtifactRecord[];
+  githubReviews: Array<{
+    label: string;
+    createdAt?: string;
+    checkRunName?: string;
+    checkRunConclusion?: string;
+    reviewEvent?: string;
+    reviewCommentCount: number;
+    annotationCount: number;
+  }>;
+  permissionAudit: PermissionAuditReport;
+  replayPackage: string;
+};
+
+export type RunAuditReplayListResponse = {
+  replays: RunAuditReplayListItem[];
+};
+
+export type RunAuditReplayResponse = {
+  replay: RunAuditReplay;
+  bundle?: RunAuditBundle;
+};
+
+export type RunAuditBundle = {
+  manifest: {
+    formatVersion: 1;
+    runId: string;
+    createdAt: string;
+    status?: AgentRunStatusRecord["status"];
+    kind?: AgentRunStatusRecord["kind"];
+    linkedPullRequests: number[];
+    linkedAdrPaths: string[];
+    eventCount: number;
+    artifactCount: number;
+    providerCallCount: number;
+    permissionDecisionCount: number;
+    githubReviewCount: number;
+  };
+  replay: RunAuditReplay;
+  files: Array<{
+    label: string;
+    kind: AgentRunArtifactRecord["kind"];
+    path?: string;
+    sha256?: string;
+  }>;
+  markdown: string;
+};
+
+export type RunAuditReplayDiffResponse = {
+  diff: {
+    baseRunId: string;
+    targetRunId: string;
+    statusChanged: boolean;
+    summaryChanged: boolean;
+    metricDelta: {
+      eventCount: number;
+      artifactCount: number;
+      providerCallCount: number;
+      permissionDecisionCount: number;
+      githubReviewCount: number;
+      durationMs: number;
+    };
+    providerChanges: { added: string[]; removed: string[]; unchanged: string[] };
+    artifactChanges: { added: string[]; removed: string[]; unchanged: string[] };
+    riskLevelChanges: { added: string[]; removed: string[]; unchanged: string[] };
+  };
+};
+
+export type TeamRole = "owner" | "reviewer" | "viewer";
+export type TeamAction = "view" | "comment" | "create_adr" | "approve_adr" | "admin";
+
+export type TeamMember = {
+  userId: string;
+  role: TeamRole;
+};
+
+export type TeamWorkspace = {
+  id: string;
+  name: string;
+  persistenceMode: "browser_local" | "sqlite" | "postgres";
+  members: TeamMember[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type TeamAccessDecision = {
+  allowed: boolean;
+  userId: string;
+  action: TeamAction;
+  role?: TeamRole;
+  reason: string;
+};
+
+export type AdrApprovalDecision = {
+  userId: string;
+  decision: "approve" | "request_changes" | "reject";
+  note?: string;
+  decidedAt: string;
+};
+
+export type AdrApprovalRecord = {
+  id: string;
+  workspaceId: string;
+  adrId: string;
+  title: string;
+  requestedBy: string;
+  requiredApprovers: string[];
+  status: "pending" | "approved" | "changes_requested" | "rejected";
+  createdAt: string;
+  updatedAt: string;
+  decisions: AdrApprovalDecision[];
+};
+
+export type PostgresPersistenceContract = {
+  mode: "postgres";
+  configured: boolean;
+  schema: string;
+  sslMode: "disable" | "prefer" | "require";
+  requiredTables: string[];
+  notes: string[];
+  repository?: {
+    available: boolean;
+    driver: "external_query_client";
+    migrationSafe: boolean;
+  };
+};
+
+export type TeamWorkspaceResponse = {
+  workspace: TeamWorkspace;
+  access?: TeamAccessDecision;
+  approvals?: AdrApprovalRecord[];
+  persistenceContract?: PostgresPersistenceContract | { mode: string; configured: boolean };
+};
+
+export type TeamAccessResponse = {
+  access: TeamAccessDecision;
+};
+
+export type TeamAdrApprovalResponse = {
+  approval: AdrApprovalRecord;
 };
 
 export type AgentRunTerminalResponse = {
@@ -593,17 +774,118 @@ export type AgentRunApprovalReplyResponse = {
     createdAt: string;
     approvedAt?: string;
     deniedAt?: string;
+    expiresAt?: string;
+    revokedAt?: string;
     replyMessage?: string;
     reason: string;
   };
 };
 
+export type PermissionApprovalLifecycleCounts = {
+  pending: number;
+  approved: number;
+  denied: number;
+  revoked: number;
+  expired: number;
+};
+
+export type PermissionLifecycleReport = {
+  generatedAt: string;
+  summary: PermissionApprovalLifecycleCounts & {
+    total: number;
+  };
+  byTool: Array<PermissionApprovalLifecycleCounts & {
+    toolName: string;
+  }>;
+  byProvider: Array<PermissionApprovalLifecycleCounts & {
+    providerId: string;
+  }>;
+};
+
+export type PermissionAuditReport = {
+  generatedAt: string;
+  summary: {
+    total: number;
+    allowed: number;
+    humanGated: number;
+    blocked: number;
+    redactedOrTruncated: number;
+  };
+  items: Array<{
+    id: string;
+    runId: string;
+    toolName: string;
+    node: string;
+    category: string;
+    risk: string;
+    decision: string;
+    status: string;
+    scope?: "run" | "tool";
+    outcome: "allowed" | "human_gated" | "blocked";
+    requestedBy: string;
+    createdAt: string;
+    approvedAt?: string;
+    deniedAt?: string;
+    expiresAt?: string;
+    revokedAt?: string;
+    requiresHumanConfirmation: boolean;
+    whyAllowedOrDenied: string;
+    outputHandling: {
+      redacted: boolean;
+      truncated: boolean;
+      reason: string;
+    };
+  }>;
+  approvalPackage: string;
+};
+
+export type ProviderCapabilityValue = boolean | "model_dependent" | "proxy_dependent" | "unknown";
+
+export type ProviderCapability = {
+  providerId: string;
+  displayName: string;
+  implementationStatus: "implemented" | "reserved" | "local_reserved";
+  capabilitySource: "adapter_verified" | "documented_not_verified" | "unknown";
+  transport: "api" | "local";
+  supportsJsonSchema: ProviderCapabilityValue;
+  supportsToolCalls: ProviderCapabilityValue;
+  supportsLongContext: ProviderCapabilityValue;
+  supportsLowCostMode: ProviderCapabilityValue;
+  notes: string[];
+};
+
+export type QuorumMindConfigSummary = {
+  loaded: boolean;
+  path?: string;
+  errors: string[];
+  mcpServers: Array<{
+    name: string;
+    command: string;
+    configuredEnvKeys: string[];
+  }>;
+  customTools: Array<{
+    name: string;
+    description: string;
+  }>;
+  agentToolAccess: Array<{
+    agentId: string;
+    tools: string[];
+  }>;
+  providerOverrides: Array<{
+    providerId: string;
+    enabled: boolean;
+    model?: string;
+    baseUrlConfigured: boolean;
+  }>;
+};
 
 export type DecisionApiHealth = {
   status: "ok";
   providerMode: "demo" | "live";
   persistence: NonNullable<DecisionApiResponse["persistence"]>;
   providerStatus: DecisionApiResponse["providerStatus"];
+  providerCapabilities: Record<string, ProviderCapability>;
+  configSummary: QuorumMindConfigSummary;
 };
 
 export type ApiSecurityPosture = {
@@ -714,6 +996,74 @@ export async function getApiSecurityPosture(fetchImpl: FetchLike = fetch): Promi
   }
 
   return body as ApiSecurityPosture;
+}
+
+export async function getPermissionAudit(fetchImpl: FetchLike = fetch): Promise<PermissionAuditReport> {
+  const response = await fetchImpl("/api/permissions/audit", {
+    method: "GET",
+    headers: apiHeaders()
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Permission audit failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as PermissionAuditReport;
+}
+
+export async function getPermissionLifecycle(fetchImpl: FetchLike = fetch): Promise<PermissionLifecycleReport> {
+  const response = await fetchImpl("/api/permissions/lifecycle", {
+    method: "GET",
+    headers: apiHeaders()
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Permission lifecycle failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as PermissionLifecycleReport;
+}
+
+export async function replyPermissionApproval(
+  approvalId: string,
+  input: AgentRunApprovalReplyRequest,
+  fetchImpl: FetchLike = fetch
+): Promise<AgentRunApprovalReplyResponse> {
+  const response = await fetchImpl(`/api/permissions/approvals/${encodeURIComponent(approvalId)}/reply`, {
+    method: "POST",
+    headers: apiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(input)
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Permission approval reply failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as AgentRunApprovalReplyResponse;
+}
+
+export async function revokePermissionApproval(
+  approvalId: string,
+  fetchImpl: FetchLike = fetch
+): Promise<AgentRunApprovalReplyResponse> {
+  const response = await fetchImpl(`/api/permissions/approvals/${encodeURIComponent(approvalId)}/revoke`, {
+    method: "POST",
+    headers: apiHeaders()
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Permission approval revoke failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as AgentRunApprovalReplyResponse;
 }
 
 export async function testProviderConnections(fetchImpl: FetchLike = fetch): Promise<ProviderConnectionTestResponse> {
@@ -869,6 +1219,195 @@ export async function getAgentRunReadModel(
   }
 
   return body as AgentRunReadModelResponse;
+}
+
+type RunAuditReplayFilters = {
+    query?: string;
+    status?: string;
+    kind?: string;
+    provider?: string;
+    pr?: number;
+    adr?: string;
+    risk?: string;
+    limit?: number;
+};
+
+export async function listRunAuditReplays(
+  filtersOrFetch?: RunAuditReplayFilters | FetchLike,
+  fetchImpl: FetchLike = fetch
+): Promise<RunAuditReplayListResponse> {
+  const filters = typeof filtersOrFetch === "function" ? undefined : filtersOrFetch;
+  const fetchClient = typeof filtersOrFetch === "function" ? filtersOrFetch : fetchImpl;
+  const query = filters ? queryString(filters) : "";
+  const response = await fetchClient(`/api/agent-runs/audit${query}`, {
+    method: "GET",
+    headers: apiHeaders()
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Run audit replay list failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as RunAuditReplayListResponse;
+}
+
+export async function getRunAuditReplay(
+  runId: string,
+  optionsOrFetch?: { bundle?: boolean } | FetchLike,
+  fetchImpl: FetchLike = fetch
+): Promise<RunAuditReplayResponse> {
+  const options = typeof optionsOrFetch === "function" ? undefined : optionsOrFetch;
+  const fetchClient = typeof optionsOrFetch === "function" ? optionsOrFetch : fetchImpl;
+  const response = await fetchClient(`/api/agent-runs/${encodeURIComponent(runId)}/audit${options?.bundle ? "?bundle=true" : ""}`, {
+    method: "GET",
+    headers: apiHeaders()
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Run audit replay failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as RunAuditReplayResponse;
+}
+
+export async function diffRunAuditReplays(
+  baseRunId: string,
+  targetRunId: string,
+  fetchImpl: FetchLike = fetch
+): Promise<RunAuditReplayDiffResponse> {
+  const response = await fetchImpl(
+    `/api/agent-runs/audit/diff?base=${encodeURIComponent(baseRunId)}&target=${encodeURIComponent(targetRunId)}`,
+    {
+      method: "GET",
+      headers: apiHeaders()
+    }
+  );
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Run audit replay diff failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as RunAuditReplayDiffResponse;
+}
+
+export async function createTeamWorkspace(
+  input: {
+    id: string;
+    name: string;
+    persistenceMode?: TeamWorkspace["persistenceMode"];
+    members: TeamMember[];
+  },
+  fetchImpl: FetchLike = fetch
+): Promise<TeamWorkspaceResponse> {
+  const response = await fetchImpl("/api/team/workspaces", {
+    method: "POST",
+    headers: apiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(input)
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Team workspace request failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as TeamWorkspaceResponse;
+}
+
+export async function getTeamWorkspace(
+  workspaceId: string,
+  fetchImpl: FetchLike = fetch
+): Promise<TeamWorkspaceResponse> {
+  const response = await fetchImpl(`/api/team/workspaces/${encodeURIComponent(workspaceId)}`, {
+    method: "GET",
+    headers: apiHeaders()
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Team workspace request failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as TeamWorkspaceResponse;
+}
+
+export async function checkTeamAccess(
+  input: {
+    workspaceId: string;
+    userId: string;
+    action: TeamAction;
+  },
+  fetchImpl: FetchLike = fetch
+): Promise<TeamAccessResponse> {
+  const response = await fetchImpl("/api/team/access", {
+    method: "POST",
+    headers: apiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(input)
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Team access request failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as TeamAccessResponse;
+}
+
+export async function createTeamAdrApproval(
+  input: {
+    workspaceId: string;
+    adrId: string;
+    title: string;
+    requestedBy: string;
+    requiredApprovers: string[];
+  },
+  fetchImpl: FetchLike = fetch
+): Promise<TeamAdrApprovalResponse> {
+  const response = await fetchImpl("/api/team/adr-approvals", {
+    method: "POST",
+    headers: apiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(input)
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Team ADR approval request failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as TeamAdrApprovalResponse;
+}
+
+export async function replyTeamAdrApproval(
+  approvalId: string,
+  input: {
+    userId: string;
+    decision: AdrApprovalDecision["decision"];
+    note?: string;
+  },
+  fetchImpl: FetchLike = fetch
+): Promise<TeamAdrApprovalResponse> {
+  const response = await fetchImpl(`/api/team/adr-approvals/${encodeURIComponent(approvalId)}/reply`, {
+    method: "POST",
+    headers: apiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(input)
+  });
+  const body = await readJson(response);
+
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : `Team ADR approval reply failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return body as TeamAdrApprovalResponse;
 }
 
 export async function resumeAgentRun(
@@ -1031,4 +1570,18 @@ function apiHeaders(base: Record<string, string> = {}): HeadersInit {
   const token = (import.meta as { env?: { VITE_QUORUMMIND_API_TOKEN?: string } }).env?.VITE_QUORUMMIND_API_TOKEN;
 
   return token ? { ...base, "X-QuorumMind-Token": token } : base;
+}
+
+function queryString(filters: Record<string, string | number | boolean | undefined>): string {
+  const params = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === "") {
+      continue;
+    }
+    params.set(key, String(value));
+  }
+
+  const serialized = params.toString();
+  return serialized ? `?${serialized}` : "";
 }

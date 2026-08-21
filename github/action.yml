@@ -1,0 +1,40 @@
+name: QuorumMind Architecture Review
+description: Run QuorumMind from GitHub issue or PR comments that contain /quorummind or /qm.
+inputs:
+  comment_body:
+    description: Override the GitHub event comment body.
+    required: false
+  repo:
+    description: Override owner/repo.
+    required: false
+  issue_number:
+    description: Override issue or PR number.
+    required: false
+  write_comment:
+    description: Post the review package back to the issue or PR conversation.
+    required: false
+    default: "false"
+  output_mode:
+    description: Render comment, check, pr_review, or all native payloads into the GitHub step summary.
+    required: false
+    default: "comment"
+  write_github:
+    description: Post native Check Run or PR Review outputs when output_mode is check, pr_review, or all.
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Install dependencies
+      shell: bash
+      run: npm ci
+    - name: Run QuorumMind GitHub runner
+      shell: bash
+      env:
+        INPUT_COMMENT_BODY: ${{ inputs.comment_body }}
+        INPUT_REPO: ${{ inputs.repo }}
+        INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        INPUT_WRITE_COMMENT: ${{ inputs.write_comment }}
+        INPUT_OUTPUT_MODE: ${{ inputs.output_mode }}
+        INPUT_WRITE_GITHUB: ${{ inputs.write_github }}
+      run: npx tsx server/github/run-github-action.ts

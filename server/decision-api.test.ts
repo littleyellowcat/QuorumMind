@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
@@ -223,6 +223,7 @@ describe("handleApiRequest", () => {
     const response = await handleApiRequest(
       new Request("http://127.0.0.1:8787/api/decisions", {
         method: "POST",
+        headers: { "X-Forwarded-For": "198.51.100.42" },
         body: JSON.stringify({
           question: "Should we use shared tables or schema-per-tenant?",
           mode: "fast",
@@ -261,6 +262,59 @@ describe("handleApiRequest", () => {
       selectedProposalId: expect.any(String),
       rankedProposals: expect.any(Array)
     });
+  });
+
+  it("returns prompt bundle agents resolved from live provider models when no custom names are supplied", async () => {
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/decisions", {
+        method: "POST",
+        headers: { "X-Forwarded-For": "198.51.100.43" },
+        body: JSON.stringify({
+          question: "Should we use shared tables or schema-per-tenant?",
+          mode: "fast",
+          locale: "en",
+          context
+        })
+      }),
+      {
+        QUORUMMIND_PROVIDER_MODE: "live",
+        QUORUMMIND_MOCK_PROVIDERS: "1"
+      }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.promptBundle.agents.map((agent: { name: string }) => agent.name)).toEqual([
+      "Mock GPT Seat Product Architect",
+      "Mock DeepSeek Seat Cost/Risk Critic",
+      "Mock Gemini Seat Strategic Reviewer"
+    ]);
+    expect(body.providerTrace.slice(0, 3).map((entry: { agentName: string }) => entry.agentName)).toEqual(
+      body.promptBundle.agents.map((agent: { name: string }) => agent.name)
+    );
+  });
+
+  it("passes the configured live provider retry budget into decision traces", async () => {
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/decisions", {
+        method: "POST",
+        body: JSON.stringify({
+          question: "Should we use shared tables or schema-per-tenant?",
+          mode: "fast",
+          locale: "en",
+          context
+        })
+      }),
+      {
+        QUORUMMIND_PROVIDER_MODE: "live",
+        QUORUMMIND_MOCK_PROVIDERS: "1",
+        QUORUMMIND_LIVE_PROVIDER_MAX_ATTEMPTS: "2"
+      }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.providerTrace.every((entry: { maxAttempts: number }) => entry.maxAttempts === 2)).toBe(true);
   });
 
   it("runs a keyless mock live blueprint trace without exposing secrets", async () => {
@@ -571,6 +625,181 @@ describe("handleApiRequest", () => {
     expect(body.timeline.map((item: { type: string }) => item.type)).toEqual(["run_start", "provider_attempt_success"]);
   });
 
+  it("exposes an audit replay list and detailed replay package through the API", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-api-audit-replay-"));
+    const statusStore = createRunStatusStore({ rootDir });
+    const eventStore = createRunEventStore({ rootDir });
+    const artifacts = createRunArtifactIndex({ rootDir });
+    const approvals = createPermissionApprovalStore({ rootDir });
+
+    statusStore.save({
+      runId: "run-1",
+      kind: "autonomous_blueprint",
+      status: "completed",
+      createdAt: "2026-08-21T08:00:00.000Z",
+      updatedAt: "2026-08-21T08:00:04.000Z",
+      summary: "GitHub architecture review"
+    });
+    eventStore.appendEvent({
+      runId: "run-1",
+      seq: 0,
+      timestamp: "2026-08-21T08:00:01.000Z",
+      type: "provider_attempt_success",
+      severity: "info",
+      phase: "proposal",
+      provider: "openrouter",
+      model: "anthropic/claude",
+      summary: "provider ok",
+      truncated: false
+    });
+    artifacts.add("run-1", {
+      kind: "bounded_output",
+      label: "GitHub native review package",
+      inline: {
+        github: {
+          checkRun: { name: "QuorumMind Architecture Review", conclusion: "neutral", annotations: [{ path: "server/auth.ts" }] },
+          pullRequestReview: { event: "COMMENT", comments: [{ path: "server/auth.ts", body: "Review boundary." }] }
+        }
+      }
+    });
+    approvals.add(createPermissionApprovalRecord(
+      decideToolPermission({
+        toolName: "mcp:github:list_pull_requests",
+        node: "github_context"
+      }),
+      {
+        runId: "run-1",
+        requestedBy: "executor_agent",
+        status: "approved",
+        createdAt: "2026-08-21T08:00:02.000Z"
+      }
+    ));
+
+    const listResponse = await handleApiRequest(new Request("http://127.0.0.1:8787/api/agent-runs/audit"), {
+      QUORUMMIND_RUN_STORE_DIR: rootDir
+    });
+    const detailResponse = await handleApiRequest(new Request("http://127.0.0.1:8787/api/agent-runs/run-1/audit"), {
+      QUORUMMIND_RUN_STORE_DIR: rootDir
+    });
+    const listBody = await listResponse.json();
+    const detailBody = await detailResponse.json();
+
+    expect(listResponse.status).toBe(200);
+    expect(listBody.replays).toEqual([
+      expect.objectContaining({
+        runId: "run-1",
+        status: "completed",
+        eventCount: 1
+      })
+    ]);
+    expect(detailResponse.status).toBe(200);
+    expect(detailBody.replay).toMatchObject({
+      summary: expect.objectContaining({ runId: "run-1" }),
+      metrics: expect.objectContaining({
+        permissionDecisionCount: 1,
+        githubReviewCount: 1
+      }),
+      githubReviews: [
+        expect.objectContaining({
+          checkRunConclusion: "neutral",
+          reviewCommentCount: 1,
+          annotationCount: 1
+        })
+      ]
+    });
+    expect(detailBody.replay.replayPackage).toContain("GitHub architecture review");
+  });
+
+  it("filters audit archives, returns bundles, and diffs two audit replays through the API", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-api-audit-archive-"));
+    const statusStore = createRunStatusStore({ rootDir });
+    const eventStore = createRunEventStore({ rootDir });
+    const artifacts = createRunArtifactIndex({ rootDir });
+
+    statusStore.save({
+      runId: "base-run",
+      kind: "autonomous_blueprint",
+      status: "completed",
+      createdAt: "2026-08-21T07:00:00.000Z",
+      updatedAt: "2026-08-21T07:00:01.000Z",
+      summary: "Base auth review"
+    });
+    statusStore.save({
+      runId: "target-run",
+      kind: "autonomous_blueprint",
+      status: "completed",
+      createdAt: "2026-08-21T08:00:00.000Z",
+      updatedAt: "2026-08-21T08:00:01.000Z",
+      summary: "Target auth PR review"
+    });
+    eventStore.appendEvent({
+      runId: "target-run",
+      seq: 0,
+      timestamp: "2026-08-21T08:00:01.000Z",
+      type: "provider_attempt_success",
+      severity: "info",
+      provider: "openrouter",
+      model: "claude",
+      summary: "provider ok",
+      truncated: false
+    });
+    artifacts.add("target-run", {
+      kind: "bounded_output",
+      label: "ADR draft",
+      path: "docs/ADR-042-auth.md",
+      sha256: "abc",
+      metadata: {
+        prNumber: 42,
+        adrPath: "docs/ADR-042-auth.md",
+        riskLevels: ["high"]
+      }
+    });
+
+    const listResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/agent-runs/audit?query=auth&status=completed&provider=openrouter&pr=42&adr=ADR-042&risk=high"),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const bundleResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/agent-runs/target-run/audit?bundle=true"),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const diffResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/agent-runs/audit/diff?base=base-run&target=target-run"),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const listBody = await listResponse.json();
+    const bundleBody = await bundleResponse.json();
+    const diffBody = await diffResponse.json();
+
+    expect(listBody.replays).toEqual([
+      expect.objectContaining({
+        runId: "target-run",
+        linkedPullRequests: [42],
+        linkedAdrPaths: ["docs/ADR-042-auth.md"]
+      })
+    ]);
+    expect(bundleBody.bundle).toMatchObject({
+      manifest: expect.objectContaining({
+        runId: "target-run",
+        linkedPullRequests: [42]
+      }),
+      files: [
+        expect.objectContaining({
+          path: "docs/ADR-042-auth.md",
+          sha256: "abc"
+        })
+      ]
+    });
+    expect(diffResponse.status).toBe(200);
+    expect(diffBody.diff).toMatchObject({
+      baseRunId: "base-run",
+      targetRunId: "target-run",
+      metricDelta: expect.objectContaining({
+        providerCallCount: 1
+      })
+    });
+  });
+
   it("accepts approval reply decisions through the API", async () => {
     const rootDir = mkdtempSync(join(tmpdir(), "quorummind-api-approval-reply-"));
     const store = createPermissionApprovalStore({ rootDir });
@@ -615,6 +844,251 @@ describe("handleApiRequest", () => {
     ]);
   });
 
+  it("returns a read-only permission audit report", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-permission-audit-"));
+    const store = createPermissionApprovalStore({ rootDir });
+    const record = createPermissionApprovalRecord(
+      decideToolPermission({
+        toolName: "quorummind_live_blueprint_provider_trace",
+        objective: "call provider",
+        node: "live_model_review"
+      }),
+      {
+        runId: "run-1",
+        requestedBy: "executor_agent",
+        createdAt: "2026-08-20T12:00:00.000Z"
+      }
+    );
+    store.add(record);
+
+    const response = await handleApiRequest(new Request("http://127.0.0.1:8787/api/permissions/audit"), {
+      QUORUMMIND_RUN_STORE_DIR: rootDir
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.summary).toMatchObject({
+      total: 1,
+      humanGated: 1
+    });
+    expect(body.items[0]).toMatchObject({
+      id: record.id,
+      requiresHumanConfirmation: true,
+      outputHandling: {
+        redacted: true
+      }
+    });
+    expect(body.approvalPackage).toContain("run-1");
+  });
+
+  it("returns permission lifecycle summary and can revoke saved approvals", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-permission-lifecycle-api-"));
+    const store = createPermissionApprovalStore({ rootDir });
+    const record = createPermissionApprovalRecord(
+      decideToolPermission({
+        toolName: "quorummind_live_blueprint_provider_trace",
+        objective: "call provider",
+        node: "live_model_review"
+      }),
+      {
+        runId: "run-lifecycle",
+        requestedBy: "executor_agent",
+        status: "approved",
+        scope: "tool",
+        createdAt: "2026-08-20T12:00:00.000Z"
+      }
+    );
+    store.add(record);
+
+    const revokeResponse = await handleApiRequest(
+      new Request(`http://127.0.0.1:8787/api/permissions/approvals/${encodeURIComponent(record.id)}/revoke`, {
+        method: "POST"
+      }),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const lifecycleResponse = await handleApiRequest(new Request("http://127.0.0.1:8787/api/permissions/lifecycle"), {
+      QUORUMMIND_RUN_STORE_DIR: rootDir
+    });
+    const lifecycle = await lifecycleResponse.json();
+
+    expect(revokeResponse.status).toBe(200);
+    expect(lifecycleResponse.status).toBe(200);
+    expect(lifecycle.summary).toMatchObject({
+      total: 1,
+      approved: 1,
+      revoked: 1
+    });
+    expect(store.savedApprovals()).toEqual([]);
+  });
+
+  it("accepts approval replies through the permission audit center route", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-permission-reply-"));
+    const store = createPermissionApprovalStore({ rootDir });
+    const record = createPermissionApprovalRecord(
+      decideToolPermission({
+        toolName: "quorummind_live_blueprint_provider_trace",
+        objective: "call provider",
+        node: "live_model_review"
+      }),
+      {
+        runId: "run-approval-center",
+        requestedBy: "executor_agent",
+        createdAt: "2026-08-20T12:00:00.000Z"
+      }
+    );
+    store.add(record);
+
+    const response = await handleApiRequest(
+      new Request(`http://127.0.0.1:8787/api/permissions/approvals/${encodeURIComponent(record.id)}/reply`, {
+        method: "POST",
+        body: JSON.stringify({
+          reply: "approve",
+          message: "Approved for this run."
+        })
+      }),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.approval).toMatchObject({
+      id: record.id,
+      status: "approved",
+      scope: "run",
+      replyMessage: "Approved for this run."
+    });
+  });
+
+  it("lists configured MCP and custom tool manifests without secrets", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-api-tools-"));
+    writeFileSync(
+      join(rootDir, "quorummind.config.json"),
+      JSON.stringify({
+        mcpServers: {
+          github: {
+            command: "npx",
+            env: { GITHUB_TOKEN: "secret-token" }
+          }
+        },
+        customTools: [{ name: "repo_diff_summary", description: "Summarize a supplied repo diff" }]
+      }),
+      "utf8"
+    );
+
+    const response = await handleApiRequest(new Request("http://127.0.0.1:8787/api/tools/manifests"), {
+      QUORUMMIND_CONFIG_DIR: rootDir
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.tools).toContainEqual(expect.objectContaining({
+      name: "mcp:github",
+      kind: "mcp_server",
+      envKeys: ["GITHUB_TOKEN"]
+    }));
+    expect(body.tools).toContainEqual(expect.objectContaining({
+      name: "repo_diff_summary",
+      kind: "custom_tool"
+    }));
+    expect(JSON.stringify(body)).not.toContain("secret-token");
+  });
+
+  it("executes configured read-only custom tools through the API and permission policy", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-api-tool-exec-"));
+    writeFileSync(
+      join(rootDir, "quorummind.config.json"),
+      JSON.stringify({
+        customTools: [{ name: "repo_diff_summary", description: "Summarize a supplied repo diff" }],
+        agents: {
+          blueprint: {
+            tools: ["repo_diff_summary"]
+          }
+        }
+      }),
+      "utf8"
+    );
+
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/tools/read-only", {
+        method: "POST",
+        body: JSON.stringify({
+          runId: "run-tool-api",
+          agentId: "blueprint",
+          toolName: "repo_diff_summary",
+          input: {
+            diffText: "diff --git a/server/auth.ts b/server/auth.ts\n+++ b/server/auth.ts\n+token"
+          }
+        })
+      }),
+      {
+        QUORUMMIND_CONFIG_DIR: rootDir,
+        QUORUMMIND_RUN_STORE_DIR: rootDir
+      }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.status).toBe("executed");
+    expect(body.permission).toMatchObject({
+      category: "read_only",
+      decision: "auto"
+    });
+    expect(body.output).toMatchObject({
+      changedFiles: ["server/auth.ts"]
+    });
+  });
+
+  it("builds a repository workspace model from selected files and review evidence", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-workspace-api-"));
+    writeFileSync(join(rootDir, "package.json"), JSON.stringify({ dependencies: { zod: "^4.0.0" } }), "utf8");
+    mkdirSync(join(rootDir, "docs"));
+    writeFileSync(join(rootDir, "docs", "ADR-001-boundary.md"), "# ADR: Boundary model\n", "utf8");
+    writeFileSync(join(rootDir, "src.ts"), "export const answer = 42;\n", "utf8");
+
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/repo/workspace", {
+        method: "POST",
+        body: JSON.stringify({
+          selectedFiles: ["src.ts"],
+          diffText: "diff --git a/src.ts b/src.ts\n+++ b/src.ts\n+export const answer = 42;",
+          testOutput: "1 passed",
+          ciStatus: "passing"
+        })
+      }),
+      { QUORUMMIND_CONFIG_DIR: rootDir }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.workspace.selectedFiles).toContainEqual(expect.objectContaining({ path: "src.ts" }));
+    expect(body.workspace.adrHistory).toContainEqual(expect.objectContaining({ path: "docs/ADR-001-boundary.md" }));
+    expect(body.workspace.testEvidence.status).toBe("passed");
+    expect(body.workspace.ciEvidence.status).toBe("passing");
+  });
+
+  it("plans a GitHub review run from a slash command without writing to GitHub by default", async () => {
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/github/run", {
+        method: "POST",
+        body: JSON.stringify({
+          commentBody: "/quorummind review-pr --pr 42 focus on auth boundaries",
+          repo: "kitten/quorummind",
+          issueNumber: 42,
+          diffText: "diff --git a/server/auth.ts b/server/auth.ts\n+++ b/server/auth.ts\n+token",
+          changedFiles: ["server/auth.ts"]
+        })
+      }),
+      { QUORUMMIND_PROVIDER_MODE: "demo" }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.status).toBe("planned");
+    expect(body.githubWriteMode).toBe("dry_run");
+    expect(body.reviewMarkdown).toContain("QuorumMind Architecture Review");
+    expect(body.reviewMarkdown).toContain("focus on auth boundaries");
+  });
+
   it("tests configured provider connectivity with mock live providers", async () => {
     const response = await handleApiRequest(
       new Request("http://127.0.0.1:8787/api/providers/test", {
@@ -634,6 +1108,229 @@ describe("handleApiRequest", () => {
     expect(body.results.every((result: { configured: boolean; responded: boolean; schemaUsable: boolean }) => result.responded)).toBe(true);
     expect(body.results.every((result: { configured: boolean; responded: boolean; schemaUsable: boolean }) => result.schemaUsable)).toBe(true);
     expect(JSON.stringify(body)).not.toContain("secret");
+  });
+
+  it("runs a bounded provider capability probe only when mock or explicitly enabled providers are available", async () => {
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/providers/probe", {
+        method: "POST",
+        body: JSON.stringify({
+          providerId: "openai",
+          sampleCount: 2
+        })
+      }),
+      {
+        QUORUMMIND_PROVIDER_MODE: "live",
+        QUORUMMIND_MOCK_PROVIDERS: "1"
+      }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.probe).toMatchObject({
+      providerId: "openai",
+      sampleCount: 2,
+      jsonSchemaStable: true,
+      failureRate: 0
+    });
+  });
+
+  it("routes provider seats for a requested task through the API", async () => {
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/providers/route", {
+        method: "POST",
+        body: JSON.stringify({
+          task: "architecture_review",
+          requirements: {
+            jsonSchema: true,
+            longContext: true,
+            maxSeats: 2
+          }
+        })
+      }),
+      {
+        OPENROUTER_API_KEY: "secret",
+        OLLAMA_BASE_URL: "http://127.0.0.1:11434"
+      }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.route.selectedSeats).toEqual([
+      expect.objectContaining({ providerId: "openrouter" }),
+      expect.objectContaining({ providerId: "ollama" })
+    ]);
+    expect(JSON.stringify(body)).not.toContain("secret");
+  });
+
+  it("runs decision quality eval through the API", async () => {
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/quality/eval", {
+        method: "POST",
+        body: JSON.stringify({
+          suiteName: "offline-smoke",
+          outputs: {
+            "tenant-architecture-review": {
+              providerId: "openrouter",
+              model: "anthropic/claude",
+              text: "Use shared tenant_id tables, include risk radar, ADR, consensus disagreement, validation tests, rollback, and migration trigger."
+            }
+          }
+        })
+      }),
+      {}
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.report.summary).toMatchObject({
+      suiteName: "offline-smoke",
+      totalCases: expect.any(Number)
+    });
+    expect(body.trend.providerReputation).toEqual(expect.arrayContaining([
+      expect.objectContaining({ providerId: "openrouter" })
+    ]));
+  });
+
+  it("keeps LLM-as-a-Judge opt-in and records a skip reason when disabled", async () => {
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/quality/eval", {
+        method: "POST",
+        body: JSON.stringify({
+          suiteName: "judge-skipped",
+          judge: {
+            enabled: true
+          },
+          outputs: {
+            "tenant-architecture-review": {
+              providerId: "openrouter",
+              model: "anthropic/claude",
+              text: "Use shared tenant tables with ADR, risk radar, rollback, validation, consensus, and migration trigger."
+            }
+          }
+        })
+      }),
+      {}
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.report.judgeSummary).toMatchObject({
+      requested: true,
+      status: "skipped",
+      reason: "QUORUMMIND_LLM_JUDGE_ENABLED is not set."
+    });
+  });
+
+  it("validates the GitHub E2E loop through the API without external writes by default", async () => {
+    const response = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/github/e2e", {
+        method: "POST",
+        body: JSON.stringify({
+          commentBody: "/qm review-pr --pr 42 focus on auth boundaries and ADR",
+          repo: "kitten/quorummind",
+          issueNumber: 42,
+          changedFiles: ["server/auth.ts"],
+          diffText: "diff --git a/server/auth.ts b/server/auth.ts\n@@ -1,1 +1,2 @@\n+const token = req.query.token"
+        })
+      }),
+      {}
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.report).toMatchObject({
+      mode: "mock",
+      passed: true,
+      readyToWrite: false
+    });
+    expect(body.report.postedRequests).toHaveLength(2);
+  });
+
+  it("creates team workspaces and evaluates access through the API", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "quorummind-api-team-"));
+    const createResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/team/workspaces", {
+        method: "POST",
+        body: JSON.stringify({
+          id: "architecture",
+          name: "Architecture Council",
+          persistenceMode: "postgres",
+          members: [
+            { userId: "alice", role: "owner" },
+            { userId: "eve", role: "viewer" }
+          ]
+        })
+      }),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir, QUORUMMIND_POSTGRES_URL: "postgres://local/redacted" }
+    );
+    const accessResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/team/access", {
+        method: "POST",
+        body: JSON.stringify({
+          workspaceId: "architecture",
+          userId: "eve",
+          action: "approve_adr"
+        })
+      }),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const adrResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/team/adr-approvals", {
+        method: "POST",
+        body: JSON.stringify({
+          workspaceId: "architecture",
+          adrId: "ADR-042",
+          title: "Auth boundary",
+          requestedBy: "alice",
+          requiredApprovers: ["alice"]
+        })
+      }),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const openResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/team/workspaces/architecture", {
+        method: "GET"
+      }),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const replyResponse = await handleApiRequest(
+      new Request("http://127.0.0.1:8787/api/team/adr-approvals/adr-architecture-ADR-042/reply", {
+        method: "POST",
+        body: JSON.stringify({
+          userId: "alice",
+          decision: "approve",
+          note: "Ready."
+        })
+      }),
+      { QUORUMMIND_RUN_STORE_DIR: rootDir }
+    );
+    const createBody = await createResponse.json();
+    const accessBody = await accessResponse.json();
+    const adrBody = await adrResponse.json();
+    const openBody = await openResponse.json();
+    const replyBody = await replyResponse.json();
+
+    expect(createResponse.status).toBe(200);
+    expect(createBody.workspace).toMatchObject({ id: "architecture", persistenceMode: "postgres" });
+    expect(createBody.persistenceContract).toMatchObject({
+      mode: "postgres",
+      configured: true,
+      repository: {
+        available: true,
+        driver: "external_query_client"
+      }
+    });
+    expect(JSON.stringify(createBody)).not.toContain("postgres://local/redacted");
+    expect(accessBody.access).toMatchObject({ allowed: false });
+    expect(adrBody.approval).toMatchObject({ adrId: "ADR-042", status: "pending" });
+    expect(openBody.approvals).toEqual([
+      expect.objectContaining({ adrId: "ADR-042" })
+    ]);
+    expect(replyBody.approval).toMatchObject({
+      adrId: "ADR-042",
+      status: "approved"
+    });
   });
 
   it("lists the autonomous blueprint endpoint in the sanitized security posture", async () => {
@@ -1012,10 +1709,33 @@ describe("handleApiRequest", () => {
   });
 
   it("returns health status without exposing provider keys", async () => {
+    const configRoot = mkdtempSync(join(tmpdir(), "qm-api-config-"));
+    writeFileSync(
+      join(configRoot, "quorummind.config.json"),
+      JSON.stringify({
+        mcpServers: {
+          github: {
+            command: "npx",
+            env: {
+              GITHUB_TOKEN: "github-secret"
+            }
+          }
+        },
+        providers: {
+          openrouter: {
+            model: "anthropic/claude-sonnet-4.5",
+            enabled: true
+          }
+        }
+      }),
+      "utf8"
+    );
     const response = await handleApiRequest(new Request("http://127.0.0.1:8787/api/health"), {
       OPENAI_API_KEY: "sk-secret",
       ANTHROPIC_API_KEY: "anthropic-secret",
-      OPENROUTER_API_KEY: "openrouter-secret"
+      OPENROUTER_API_KEY: "openrouter-secret",
+      QUORUMMIND_CONFIG_DIR: configRoot,
+      QUORUMMIND_RATE_LIMIT_MAX: "1000"
     });
     const body = await response.json();
 
@@ -1023,6 +1743,7 @@ describe("handleApiRequest", () => {
     expect(JSON.stringify(body)).not.toContain("sk-secret");
     expect(JSON.stringify(body)).not.toContain("anthropic-secret");
     expect(JSON.stringify(body)).not.toContain("openrouter-secret");
+    expect(JSON.stringify(body)).not.toContain("github-secret");
     expect(body.status).toBe("ok");
     expect(body.persistence).toMatchObject({
       mode: "browser_local",
@@ -1032,13 +1753,26 @@ describe("handleApiRequest", () => {
     expect(body.providerStatus.deepseek.implemented).toBe(true);
     expect(body.providerStatus.anthropic).toMatchObject({
       configured: true,
-      implemented: false,
+      implemented: true,
       envKey: "ANTHROPIC_API_KEY"
     });
     expect(body.providerStatus.openrouter).toMatchObject({
       configured: true,
-      implemented: false,
+      implemented: true,
       envKey: "OPENROUTER_API_KEY"
+    });
+    expect(body.providerCapabilities.openrouter).toMatchObject({
+      implementationStatus: "implemented",
+      supportsToolCalls: "model_dependent"
+    });
+    expect(body.providerCapabilities.ollama).toMatchObject({
+      implementationStatus: "implemented",
+      supportsLowCostMode: true
+    });
+    expect(body.configSummary).toMatchObject({
+      loaded: true,
+      mcpServers: [{ name: "github", command: "npx", configuredEnvKeys: ["GITHUB_TOKEN"] }],
+      providerOverrides: [{ providerId: "openrouter", enabled: true, model: "anthropic/claude-sonnet-4.5" }]
     });
   });
 
@@ -1065,13 +1799,14 @@ describe("handleApiRequest", () => {
 
   it("requires an API token when configured", async () => {
     const denied = await handleApiRequest(new Request("http://127.0.0.1:8787/api/health"), {
-      QUORUMMIND_API_TOKEN: "local-secret"
+      QUORUMMIND_API_TOKEN: "local-secret",
+      QUORUMMIND_RATE_LIMIT_MAX: "1000"
     });
     const allowed = await handleApiRequest(
       new Request("http://127.0.0.1:8787/api/health", {
         headers: { "X-QuorumMind-Token": "local-secret" }
       }),
-      { QUORUMMIND_API_TOKEN: "local-secret" }
+      { QUORUMMIND_API_TOKEN: "local-secret", QUORUMMIND_RATE_LIMIT_MAX: "1000" }
     );
 
     expect(denied.status).toBe(401);
@@ -1103,7 +1838,8 @@ describe("handleApiRequest", () => {
   it("exposes a sanitized API security posture summary", async () => {
     const response = await handleApiRequest(new Request("http://127.0.0.1:8787/api/security"), {
       QUORUMMIND_API_TOKEN: "local-secret",
-      QUORUMMIND_ALLOWED_ORIGINS: "http://localhost:5173"
+      QUORUMMIND_ALLOWED_ORIGINS: "http://localhost:5173",
+      QUORUMMIND_RATE_LIMIT_MAX: "1000"
     });
     const body = await response.json();
 
@@ -1115,7 +1851,8 @@ describe("handleApiRequest", () => {
       }),
       {
         QUORUMMIND_API_TOKEN: "local-secret",
-        QUORUMMIND_ALLOWED_ORIGINS: "http://localhost:5173"
+        QUORUMMIND_ALLOWED_ORIGINS: "http://localhost:5173",
+        QUORUMMIND_RATE_LIMIT_MAX: "1000"
       }
     );
     const authorizedBody = await authorized.json();

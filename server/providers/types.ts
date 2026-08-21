@@ -19,19 +19,23 @@ export type ProviderRequest = {
 
 export type ProviderFetch = (url: string, init?: RequestInit) => Promise<Response>;
 
-export type ImplementedProviderId = "model_gateway" | "openai" | "deepseek" | "gemini";
+export type ImplementedProviderId =
+  | "model_gateway"
+  | "openai"
+  | "deepseek"
+  | "gemini"
+  | "anthropic"
+  | "openrouter"
+  | "ollama"
+  | "lmstudio";
 
 export type ReservedProviderId =
-  | "anthropic"
   | "xai"
   | "mistral"
-  | "openrouter"
   | "groq"
   | "together"
   | "cohere"
-  | "perplexity"
-  | "ollama"
-  | "lmstudio";
+  | "perplexity";
 
 export type ProviderId = ImplementedProviderId | ReservedProviderId;
 
@@ -50,4 +54,11 @@ export type ProviderConfig = {
 export type GatewayProviderConfig = ProviderConfig & {
   baseUrl: string;
   providerId?: ImplementedProviderId;
+};
+
+export type LocalOpenAICompatibleProviderConfig = {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+  fetch?: ProviderFetch;
 };

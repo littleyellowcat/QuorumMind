@@ -17,8 +17,6 @@ export type ProviderConnectionTestResult = {
   validationIssues: ProviderValidationIssue[];
 };
 
-const targetProviders: ImplementedProviderId[] = ["openai", "deepseek", "gemini"];
-
 const connectionTestContext: DecisionContext = {
   productStage: "mvp",
   expectedScale: "20-50 enterprise tenants",
@@ -33,38 +31,27 @@ const connectionTestContext: DecisionContext = {
 
 export async function testProviderConnections(env: Env): Promise<ProviderConnectionTestResult[]> {
   const providers = createConfiguredProviders(env).slice(0, 3);
-  const providerById = new Map<ImplementedProviderId, ModelProvider>();
-
-  for (const provider of providers) {
-    if (!providerById.has(provider.id) && targetProviders.includes(provider.id)) {
-      providerById.set(provider.id, provider);
-    }
-  }
-
   const status = getProviderStatus(env);
 
-  return Promise.all(
-    targetProviders.map((providerId) => {
-      const provider = providerById.get(providerId);
+  if (providers.length === 0) {
+    return Object.values(status)
+      .filter((provider) => provider.implemented && provider.configured)
+      .slice(0, 3)
+      .map((provider) => ({
+        provider: provider.id as ImplementedProviderId,
+        model: provider.model,
+        configured: false,
+        responded: false,
+        jsonParsed: false,
+        schemaUsable: false,
+        validationStatus: "not_configured" as const,
+        durationMs: 0,
+        failureReason: "Provider is not configured for the current live model seats.",
+        validationIssues: []
+      }));
+  }
 
-      if (!provider) {
-        return Promise.resolve({
-          provider: providerId,
-          model: status[providerId].model,
-          configured: false,
-          responded: false,
-          jsonParsed: false,
-          schemaUsable: false,
-          validationStatus: "not_configured" as const,
-          durationMs: 0,
-          failureReason: "Provider is not configured for the current live model seats.",
-          validationIssues: []
-        });
-      }
-
-      return testSingleProvider(provider, providerTestTimeoutMs(env));
-    })
-  );
+  return Promise.all(providers.map((provider) => testSingleProvider(provider, providerTestTimeoutMs(env))));
 }
 
 async function testSingleProvider(provider: ModelProvider, timeoutMs: number): Promise<ProviderConnectionTestResult> {
@@ -118,10 +105,10 @@ async function testSingleProvider(provider: ModelProvider, timeoutMs: number): P
   }
 }
 
-function providerTestTimeoutMs(env: Env): number {
+export function providerTestTimeoutMs(env: Env): number {
   const parsed = Number(env.QUORUMMIND_PROVIDER_TEST_TIMEOUT_MS);
 
-  return Number.isInteger(parsed) && parsed >= 5_000 && parsed <= 120_000 ? parsed : 30_000;
+  return Number.isInteger(parsed) && parsed >= 5_000 && parsed <= 300_000 ? parsed : 30_000;
 }
 
 function schemaIssueSummary(issues: ProviderValidationIssue[] | undefined): string | undefined {

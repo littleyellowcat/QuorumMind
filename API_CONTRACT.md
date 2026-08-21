@@ -19,10 +19,30 @@ Returns provider mode and provider slot status. Secret values are never included
       "configured": false,
       "implemented": true,
       "model": "gpt-4o-mini"
+    },
+    "openrouter": {
+      "configured": false,
+      "implemented": true,
+      "model": "openai/gpt-5.2"
+    },
+    "ollama": {
+      "configured": false,
+      "implemented": true,
+      "model": "llama3.1"
     }
+  },
+  "providerCapabilities": {},
+  "configSummary": {
+    "loaded": false,
+    "mcpServers": [],
+    "customTools": [],
+    "agentToolAccess": [],
+    "providerOverrides": []
   }
 }
 ```
+
+Implemented provider adapters include OpenAI, DeepSeek, Gemini, Anthropic, OpenRouter, Ollama, LM Studio, and the unified OpenAI-compatible model gateway. Reserved provider slots still appear in `providerStatus` with `implemented: false`.
 
 ## `GET /api/security`
 
@@ -49,12 +69,49 @@ Returns a sanitized API security posture summary. Secret values are never includ
 }
 ```
 
+The security posture also documents `/api/providers/probe`, `/api/providers/route`, `/api/quality/eval`, `/api/repo/workspace`, `/api/agent-runs/audit`, `/api/agent-runs/:id/audit`, `/api/agent-runs/audit/diff`, `/api/permissions/audit`, `/api/permissions/lifecycle`, `/api/permissions/approvals/:id/reply`, `/api/permissions/approvals/:id/revoke`, `/api/tools/manifests`, `/api/tools/read-only`, `/api/github/run`, `/api/github/e2e`, `/api/team/workspaces`, `/api/team/workspaces/:id`, `/api/team/access`, `/api/team/adr-approvals`, and `/api/team/adr-approvals/:id/reply`.
+
 If `QUORUMMIND_API_TOKEN` is configured, every API route requires either:
 
 - `X-QuorumMind-Token: <token>`
 - `Authorization: Bearer <token>`
 
 Browser origins must match `QUORUMMIND_ALLOWED_ORIGINS`; wildcard CORS is not used.
+
+## `POST /api/providers/probe`
+
+Runs a bounded provider capability probe against configured providers. Real provider probes are disabled unless `QUORUMMIND_PROVIDER_PROBE_ENABLED=1` is set. Mock probes work when `QUORUMMIND_MOCK_PROVIDERS=1`.
+
+Request:
+
+```json
+{
+  "providerId": "openai",
+  "sampleCount": 2
+}
+```
+
+Response:
+
+```json
+{
+  "probe": {
+    "providerId": "openai",
+    "model": "mock-gpt-seat",
+    "sampleCount": 2,
+    "jsonSchemaStable": true,
+    "toolCallsAvailable": "unknown",
+    "longContextLimit": "unknown",
+    "priceTier": "unknown",
+    "failureRate": 0,
+    "averageLatencyMs": 25,
+    "repairRate": 0,
+    "recommendedUseCases": ["architecture_review", "adr_generation"]
+  }
+}
+```
+
+If `providerId` is omitted, the endpoint probes up to three configured providers and returns `{ "probes": [] }`.
 
 ## `POST /api/decisions`
 
@@ -390,6 +447,475 @@ Runtime controls:
 - `agentRuntime.humanReviewNote` is optional. It is attached as resume evidence when the graph reaches `human_review_gate` on the same checkpoint thread.
 - `blueprintRuntime.executionMode` is optional and defaults to `live`. Use `deterministic` for quick local runs with no provider calls.
 - `blueprintRuntime.maxProviderRounds` is optional and caps live provider trace phases for Blueprint runs.
+
+## `POST /api/github/run`
+
+Plans a GitHub issue/PR architecture review from a `/quorummind` or `/qm` comment. The endpoint defaults to dry-run and does not write GitHub comments.
+
+Request:
+
+```json
+{
+  "commentBody": "/quorummind review-pr --pr 42 focus on auth boundaries",
+  "repo": "owner/repo",
+  "issueNumber": 42,
+  "diffText": "diff --git a/server/auth.ts b/server/auth.ts\n+++ b/server/auth.ts\n+token",
+  "changedFiles": ["server/auth.ts"]
+}
+```
+
+Response:
+
+```json
+{
+  "status": "planned",
+  "githubWriteMode": "dry_run",
+  "reviewMarkdown": "# QuorumMind Architecture Review\n...",
+  "githubNative": {
+    "checkRun": {
+      "name": "QuorumMind Architecture Review",
+      "conclusion": "neutral",
+      "output": {
+        "annotations": []
+      }
+    },
+    "pullRequestReview": {
+      "pullNumber": 42,
+      "event": "COMMENT",
+      "comments": []
+    }
+  },
+  "writeRequest": {
+    "owner": "owner",
+    "repo": "repo",
+    "issueNumber": 42,
+    "body": "# QuorumMind Architecture Review\n..."
+  }
+}
+```
+
+The companion `github/action.yml` runs `server/github/run-github-action.ts`. It writes the selected payload to the GitHub step summary by default. `output_mode` can be `comment`, `check`, `pr_review`, or `all`. It posts a normal issue/PR comment only when `write_comment: "true"` is supplied. It posts native Check Run or PR Review outputs only when `write_github: "true"` is supplied with `GITHUB_TOKEN`; Check Run output also requires `GITHUB_SHA`.
+
+`server/github/github-context.ts` can ingest deeper PR context for runners that provide a token: changed files, patches, issue comments, labels, and review history. The API response never includes the GitHub token.
+
+## `POST /api/github/e2e`
+
+Validates the `/qm review-pr` to native Check Run and PR Review loop. The endpoint runs in mock write mode unless the request sets `write: true` and the server has `QUORUMMIND_GITHUB_E2E_WRITE=1`. Live mode also needs `GITHUB_TOKEN` and `GITHUB_SHA`.
+
+```json
+{
+  "commentBody": "/qm review-pr --pr 42 focus on auth boundaries",
+  "repo": "owner/repo",
+  "issueNumber": 42,
+  "changedFiles": ["server/auth.ts"],
+  "diffText": "diff --git a/server/auth.ts b/server/auth.ts\n@@ -1,1 +1,2 @@\n+token",
+  "write": false
+}
+```
+
+Response:
+
+```json
+{
+  "report": {
+    "mode": "mock",
+    "passed": true,
+    "readyToWrite": false,
+    "steps": [
+      { "id": "command_planned", "passed": true },
+      { "id": "native_payload_valid", "passed": true },
+      { "id": "check_run_roundtrip", "passed": true },
+      { "id": "pr_review_roundtrip", "passed": true }
+    ],
+    "postedRequests": [
+      { "kind": "check_run", "url": "https://api.github.com/repos/owner/repo/check-runs" },
+      { "kind": "pr_review", "url": "https://api.github.com/repos/owner/repo/pulls/42/reviews" }
+    ]
+  }
+}
+```
+
+## `GET /api/agent-runs/audit`
+
+Lists recent server-side run audit replay summaries. The response is read-only and is used by the Workbench Run Audit Replay panel.
+
+```json
+{
+  "replays": [
+    {
+      "runId": "run-1",
+      "kind": "autonomous_blueprint",
+      "status": "completed",
+      "eventCount": 4,
+      "artifactCount": 2
+    }
+  ]
+}
+```
+
+## `GET /api/agent-runs/:runId/audit`
+
+Returns a merged audit replay for one run, including read-model summary, event timeline, provider calls, artifacts, GitHub native review outputs, permission audit, and a copyable Markdown replay package. `?bundle=true` also returns an exportable audit bundle.
+
+```json
+{
+  "replay": {
+    "summary": { "runId": "run-1", "eventCount": 4, "artifactCount": 2 },
+    "metrics": {
+      "providerCallCount": 2,
+      "permissionDecisionCount": 1,
+      "githubReviewCount": 1
+    },
+    "providerCalls": [],
+    "githubReviews": [],
+    "permissionAudit": {},
+    "replayPackage": "# QuorumMind Run Audit Replay\n..."
+  },
+  "bundle": {
+    "manifest": {
+      "formatVersion": 1,
+      "runId": "run-1",
+      "linkedPullRequests": [42],
+      "linkedAdrPaths": ["docs/ADR-042-auth.md"],
+      "providerCallCount": 2
+    },
+    "files": [],
+    "markdown": "# QuorumMind Run Audit Bundle\n..."
+  }
+}
+```
+
+## `GET /api/agent-runs/audit`
+
+Lists server-side audit archive summaries. Query parameters:
+
+- `query`: text search across run id, summary, provider, PR, ADR, and risk metadata.
+- `status`: `running`, `paused`, `completed`, `failed`, or `interrupted`.
+- `kind`: `live_decision` or `autonomous_blueprint`.
+- `provider`: provider id/name fragment.
+- `pr`: linked pull request number.
+- `adr`: ADR path fragment.
+- `risk`: risk level.
+- `limit`: maximum rows.
+
+Response items include `providers`, `linkedPullRequests`, `linkedAdrPaths`, and `riskLevels` in addition to status/event/artifact counts.
+
+## `GET /api/agent-runs/audit/diff`
+
+Compares two run audit replays.
+
+```json
+{
+  "diff": {
+    "baseRunId": "run-a",
+    "targetRunId": "run-b",
+    "statusChanged": false,
+    "summaryChanged": true,
+    "metricDelta": {
+      "eventCount": 3,
+      "artifactCount": 1,
+      "providerCallCount": 2,
+      "permissionDecisionCount": 0,
+      "githubReviewCount": 1,
+      "durationMs": 1200
+    },
+    "providerChanges": { "added": ["openrouter"], "removed": [], "unchanged": ["openai"] },
+    "artifactChanges": { "added": ["docs/ADR-042-auth.md"], "removed": [], "unchanged": [] },
+    "riskLevelChanges": { "added": ["high"], "removed": [], "unchanged": [] }
+  }
+}
+```
+
+## `POST /api/repo/workspace`
+
+Builds a bounded, read-only repository workspace model from the server-side repo root (`QUORUMMIND_CONFIG_DIR` when set, otherwise the current working directory).
+
+Request:
+
+```json
+{
+  "selectedFiles": ["README.md"],
+  "diffText": "diff --git a/README.md b/README.md\n+++ b/README.md\n+new line",
+  "testOutput": "1 passed",
+  "ciStatus": "passing"
+}
+```
+
+Response:
+
+```json
+{
+  "workspace": {
+    "fileTree": [],
+    "selectedFiles": [
+      {
+        "path": "README.md",
+        "lineCount": 42,
+        "preview": "# QuorumMind"
+      }
+    ],
+    "adrHistory": [],
+    "dependencyGraph": { "nodes": [], "edges": [] },
+    "architectureGraph": { "nodes": [], "edges": [] },
+    "architectureBoundaries": [],
+    "apiSurface": [],
+    "evidenceIndex": [],
+    "changeImpact": [],
+    "codeHotspots": [],
+    "testEvidence": { "status": "passed" },
+    "ciEvidence": { "status": "passing" }
+  }
+}
+```
+
+## `POST /api/providers/route`
+
+Selects configured provider/model seats for a task using the capability matrix.
+
+```json
+{
+  "task": "architecture_review",
+  "requirements": {
+    "jsonSchema": true,
+    "toolCalls": false,
+    "longContext": true,
+    "lowCost": false,
+    "localOnly": false,
+    "maxSeats": 2
+  }
+}
+```
+
+```json
+{
+  "route": {
+    "task": "architecture_review",
+    "selectedSeats": [
+      {
+        "providerId": "openrouter",
+        "model": "anthropic/claude-sonnet-4.5",
+        "score": 81,
+        "rationale": ["OpenRouter is configured and implemented."],
+        "capabilityWarnings": ["JSON schema is model-dependent and should be verified for this model."]
+      }
+    ],
+    "excludedSeats": [
+      { "providerId": "xai", "reason": "Provider is not implemented in QuorumMind yet." }
+    ],
+    "capabilityWarnings": [],
+    "explanation": "Provider route for architecture_review: selected 1 configured model seat using capability matrix requirements."
+  }
+}
+```
+
+## `POST /api/quality/eval`
+
+Runs deterministic golden-case judging. This is a stable local quality gate by default. An optional LLM judge is available only when the request sets `judge.enabled: true` and the server sets `QUORUMMIND_LLM_JUDGE_ENABLED=1`.
+
+```json
+{
+  "suiteName": "offline-smoke",
+  "outputs": {
+    "tenant-architecture-review": {
+      "providerId": "openrouter",
+      "model": "anthropic/claude",
+      "text": "Use shared tenant tables... include ADR, risk, consensus, rollback, validation."
+    }
+  },
+  "judge": {
+    "enabled": false,
+    "providerId": "openrouter"
+  }
+}
+```
+
+Response:
+
+```json
+{
+  "report": {
+    "summary": {
+      "suiteName": "offline-smoke",
+      "totalCases": 3,
+      "passedCases": 1,
+      "failedCases": 0,
+      "missingOutputCases": 2,
+      "averageScore": 31.3
+    },
+    "findings": [],
+    "judgeSummary": {
+      "requested": false,
+      "status": "not_requested",
+      "judgedCases": 0,
+      "privacyNote": "No LLM judge was requested; deterministic local rubric was used."
+    }
+  },
+  "trend": {
+    "suiteName": "offline-smoke",
+    "providerReputation": [
+      {
+        "providerId": "openrouter",
+        "sampleCount": 1,
+        "qualityBand": "strong"
+      }
+    ]
+  }
+}
+```
+
+## `POST /api/team/workspaces`
+
+Creates or updates a local team workspace record.
+
+```json
+{
+  "id": "architecture",
+  "name": "Architecture Council",
+  "persistenceMode": "postgres",
+  "members": [
+    { "userId": "alice", "role": "owner" },
+    { "userId": "bob", "role": "reviewer" }
+  ]
+}
+```
+
+Response includes a sanitized `persistenceContract`. For Postgres, it reports configured state, schema, SSL mode, and required table names without returning `QUORUMMIND_POSTGRES_URL`.
+
+## `GET /api/team/workspaces/:id`
+
+Returns one workspace, its ADR approval records, and sanitized persistence contract metadata.
+
+## `POST /api/team/access`
+
+Checks whether a user can perform `view`, `comment`, `create_adr`, `approve_adr`, or `admin` in a workspace.
+
+## `POST /api/team/adr-approvals`
+
+Creates an ADR approval record for a workspace.
+
+## `POST /api/team/adr-approvals/:id/reply`
+
+Records an ADR approval decision.
+
+```json
+{
+  "userId": "bob",
+  "decision": "approve",
+  "note": "Risk and rollback notes are clear."
+}
+```
+
+The response returns the updated approval with status `pending`, `approved`, `changes_requested`, or `rejected`.
+
+## `GET /api/tools/manifests`
+
+Returns sanitized MCP server and custom tool manifests from `quorummind.config.json`.
+
+```json
+{
+  "tools": [
+    {
+      "name": "mcp:github",
+      "kind": "mcp_server",
+      "description": "Configured MCP server command: npx",
+      "envKeys": ["GITHUB_TOKEN"]
+    },
+    {
+      "name": "repo_diff_summary",
+      "kind": "custom_tool",
+      "description": "Summarize a supplied repo diff"
+    }
+  ]
+}
+```
+
+Environment values, command args, and secrets are not returned.
+
+## `POST /api/tools/read-only`
+
+Executes a configured read-only custom tool through the same permission policy used by agent tools. The requesting `agentId` must have the tool listed under `agents.<agentId>.tools` in `quorummind.config.json`.
+
+```json
+{
+  "runId": "run-tool-api",
+  "agentId": "blueprint",
+  "toolName": "repo_diff_summary",
+  "input": {
+    "diffText": "diff --git a/server/auth.ts b/server/auth.ts\n+++ b/server/auth.ts\n+token"
+  }
+}
+```
+
+Successful response:
+
+```json
+{
+  "status": "executed",
+  "permission": {
+    "category": "read_only",
+    "risk": "low",
+    "decision": "auto"
+  },
+  "output": {
+    "toolName": "repo_diff_summary",
+    "changedFiles": ["server/auth.ts"],
+    "diffSummary": "1 files changed",
+    "riskRadar": []
+  }
+}
+```
+
+MCP server process execution is not enabled by this endpoint. MCP declarations are listed and audited as manifests; custom tool execution is currently limited to read-only repo-evidence summarization. Server-side code can use `server/tools/mcp-runtime.ts` to start a stdio MCP process, list tools, and call read-only tool names through the permission store. No public route starts arbitrary MCP commands.
+
+## `GET /api/permissions/audit`
+
+Returns the permission audit report used by the Workbench Permission Audit Center. The report includes counts, per-tool rationale, output handling notes, and a copyable Markdown approval package.
+
+## `GET /api/permissions/lifecycle`
+
+Returns approval lifecycle counts by tool and provider, including pending, approved, denied, revoked, and expired approvals.
+
+```json
+{
+  "summary": {
+    "total": 2,
+    "pending": 1,
+    "approved": 1,
+    "denied": 0,
+    "revoked": 1,
+    "expired": 0
+  },
+  "byTool": [],
+  "byProvider": []
+}
+```
+
+## `POST /api/permissions/approvals/:id/reply`
+
+Approves, always-approves, or rejects a pending permission gate.
+
+```json
+{
+  "reply": "approve",
+  "message": "Approved for this run."
+}
+```
+
+`reply` must be `approve`, `always`, or `reject`. `always` stores a tool-scoped approval; `approve` stores a run-scoped approval; `reject` marks the approval denied.
+
+## `POST /api/permissions/approvals/:id/revoke`
+
+Revokes a saved approval while preserving the audit record.
+
+```json
+{
+  "approval": {
+    "id": "run:node:tool:createdAt",
+    "status": "approved",
+    "revokedAt": "2026-08-21T00:00:00.000Z"
+  }
+}
+```
 
 Consensus loop behavior: the graph validates each Blueprint consensus round in order. If the score is below the threshold and another round exists within `maxConsensusRounds`, it routes `validate_result -> revise_discussion -> critic_agent -> supervisor_agent -> validate_result`. It finalizes only after the threshold is reached or routes through `human_review_gate` when the round budget is exhausted.
 

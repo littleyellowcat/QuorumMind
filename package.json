@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "bin": {
+    "quorummind": "./bin/quorummind.mjs"
+  },
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "dev:web": "vite",
@@ -20,6 +23,9 @@
     "agent:eval:expanded": "QUORUMMIND_AGENT_EVAL_SUITE=expanded tsx scripts/agent-performance-eval.ts",
     "agent:eval:full": "QUORUMMIND_AGENT_EVAL_SUITE=full tsx scripts/agent-performance-eval.ts",
     "agent:judge": "tsx scripts/agent-judge-audit.ts",
+    "quorummind": "tsx scripts/quorummind-cli.ts",
+    "github:e2e": "tsx scripts/github-e2e.ts",
+    "distribution:doctor": "tsx scripts/distribution-doctor.ts",
     "visual:audit": "tsx scripts/visual-audit.ts",
     "preview": "vite preview",
     "test": "vitest --passWithNoTests",

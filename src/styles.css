@@ -1355,6 +1355,305 @@ select:focus {
   line-height: 1.45;
 }
 
+.permission-audit-center {
+  display: grid;
+  gap: 10px;
+}
+
+.permission-audit-center > header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.permission-audit-center > header span,
+.permission-audit-item span {
+  color: var(--color-primary-strong);
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.permission-audit-center > header strong {
+  display: block;
+  margin-top: 2px;
+  color: var(--color-ink);
+}
+
+.permission-audit-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.permission-audit-stats span {
+  min-width: 0;
+  border: 1px solid color-mix(in oklch, var(--color-primary) 18%, var(--color-border));
+  border-radius: var(--radius-md);
+  padding: 8px;
+  color: var(--color-ink);
+  background: color-mix(in oklch, var(--color-surface) 82%, white);
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-align: center;
+}
+
+.permission-audit-list {
+  display: grid;
+  gap: 8px;
+}
+
+.permission-audit-item {
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--color-success);
+  border-radius: var(--radius-md);
+  padding: 9px;
+  background: color-mix(in oklch, var(--color-surface) 82%, white);
+}
+
+.permission-audit-item.human_gated {
+  border-left-color: var(--color-warning);
+}
+
+.permission-audit-item.blocked {
+  border-left-color: var(--color-danger);
+}
+
+.permission-audit-item strong {
+  color: var(--color-ink);
+  font-size: 0.84rem;
+  overflow-wrap: anywhere;
+}
+
+.permission-audit-item small,
+.permission-audit-item p {
+  color: var(--color-muted);
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.permission-audit-item p {
+  margin: 0;
+}
+
+.permission-reply-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.permission-reply-actions .secondary-action {
+  min-height: 30px;
+  padding: 6px 8px;
+  font-size: 0.72rem;
+}
+
+.danger-action {
+  border-color: color-mix(in oklch, var(--color-danger) 42%, var(--color-border));
+  color: var(--color-danger);
+}
+
+.audit-replay-center {
+  display: grid;
+  gap: 10px;
+}
+
+.audit-replay-center > header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.audit-replay-center > header span,
+.audit-replay-grid span,
+.audit-replay-timeline span {
+  color: var(--color-primary-strong);
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.audit-replay-center > header strong {
+  display: block;
+  margin-top: 2px;
+  color: var(--color-ink);
+}
+
+.audit-replay-list,
+.audit-replay-detail,
+.audit-replay-timeline {
+  display: grid;
+  gap: 8px;
+}
+
+.audit-replay-list button {
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 9px;
+  color: var(--color-ink);
+  background: color-mix(in oklch, var(--color-surface) 84%, white);
+  text-align: left;
+}
+
+.audit-replay-list button.active {
+  border-color: color-mix(in oklch, var(--color-primary) 45%, var(--color-border));
+  background: color-mix(in oklch, var(--color-primary) 9%, var(--color-surface));
+}
+
+.audit-replay-list strong,
+.audit-replay-list span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.audit-replay-list strong {
+  font-size: 0.8rem;
+}
+
+.audit-replay-list span {
+  margin-top: 4px;
+  color: var(--color-muted);
+  font-size: 0.72rem;
+  font-weight: 750;
+}
+
+.audit-replay-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.audit-replay-grid article {
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 9px;
+  background: color-mix(in oklch, var(--color-surface) 84%, white);
+}
+
+.audit-replay-grid strong {
+  color: var(--color-ink);
+  font-size: 0.86rem;
+  overflow-wrap: anywhere;
+}
+
+.audit-replay-grid small,
+.audit-replay-timeline small {
+  color: var(--color-muted);
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+
+.audit-replay-timeline {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.audit-replay-timeline li {
+  display: grid;
+  gap: 3px;
+  border-left: 3px solid var(--color-primary);
+  padding: 4px 0 4px 8px;
+}
+
+.team-workspace-center {
+  display: grid;
+  gap: 10px;
+}
+
+.team-workspace-center > header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.team-workspace-center > header span,
+.team-workspace-summary span,
+.team-approval-item span {
+  color: var(--color-primary-strong);
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.team-workspace-center > header strong {
+  display: block;
+  margin-top: 2px;
+  color: var(--color-ink);
+}
+
+.team-workspace-summary,
+.team-approval-list {
+  display: grid;
+  gap: 8px;
+}
+
+.team-workspace-summary article,
+.team-approval-item {
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 9px;
+  background: color-mix(in oklch, var(--color-surface) 84%, white);
+}
+
+.team-workspace-summary strong,
+.team-approval-item strong {
+  color: var(--color-ink);
+  font-size: 0.84rem;
+  overflow-wrap: anywhere;
+}
+
+.team-workspace-summary small,
+.team-approval-item small,
+.team-approval-item p {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+
+.team-member-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.team-member-list span {
+  border: 1px solid color-mix(in oklch, var(--color-primary) 18%, var(--color-border));
+  border-radius: var(--radius-md);
+  padding: 6px 8px;
+  color: var(--color-ink);
+  background: color-mix(in oklch, var(--color-surface) 82%, white);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.team-approval-item.pending {
+  border-left: 3px solid var(--color-warning);
+}
+
+.team-approval-item.approved {
+  border-left: 3px solid var(--color-success);
+}
+
+.team-approval-item.changes_requested,
+.team-approval-item.rejected {
+  border-left: 3px solid var(--color-danger);
+}
+
 .blueprint-execution-panel .profile-switch {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
